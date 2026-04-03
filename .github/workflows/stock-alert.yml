@@ -1,0 +1,26 @@
+name: 주식 정보 자동 알림
+
+on:
+  schedule:
+    - cron: '0 23 * * *'   # 매일 오전 8시 KST (UTC 기준)
+  workflow_dispatch:         # 수동 실행 버튼
+
+jobs:
+  send-stock-alert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: 주식 알림 실행
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python src/main.py
