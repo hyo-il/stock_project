@@ -2,8 +2,11 @@
 
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+KST = ZoneInfo("Asia/Seoul")
 
 
 def collect_stock_data() -> dict:
@@ -36,7 +39,7 @@ def _collect_korean_indices() -> dict:
 
     result = {}
     indices = {"KOSPI": "KS11", "KOSDAQ": "KQ11"}
-    end_date = datetime.today()
+    end_date = datetime.now(KST)
     start_date = end_date - timedelta(days=7)
 
     for name, ticker in indices.items():

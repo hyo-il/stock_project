@@ -2,7 +2,8 @@ name: 주식 정보 자동 알림
 
 on:
   schedule:
-    - cron: '0 23 * * *'   # 매일 오전 8시 KST (UTC 기준)
+    - cron: '30 21 * * *'   # 오전 7시 KST 목표 (UTC 21:30 = KST 06:30, 지연 감안)
+    - cron: '30 9 * * *'    # 오후 7시 KST 목표 (UTC 09:30 = KST 18:30, 지연 감안)
   workflow_dispatch:         # 수동 실행 버튼
 
 jobs:
