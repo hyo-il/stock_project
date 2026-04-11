@@ -6,6 +6,10 @@ on:
     - cron: '30 12 * * 1-5'   # 월~금 오후 21:30 KST 목표 (UTC 12:30)
   workflow_dispatch:         # 수동 실행 버튼
 
+concurrency:
+  group: stock-alert-${{ github.event.schedule || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   send-stock-alert:
     runs-on: ubuntu-latest
