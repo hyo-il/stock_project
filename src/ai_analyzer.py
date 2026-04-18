@@ -40,12 +40,17 @@ def _get_gemini_client():
 
 
 def _make_gen_config():
-    """텍스트 분석용 generation_config 객체를 생성합니다. 패키지 문제 시 None 반환."""
+    """텍스트 분석용 generation_config 객체를 생성합니다. 패키지 문제 시 None 반환.
+
+    gemini-2.5-flash는 thinking 모델이라 thinking 토큰이 output 한도를 소비합니다.
+    분석 결과가 잘리지 않도록 thinking을 비활성화하고 출력 한도를 충분히 설정합니다.
+    """
     try:
         from google.genai import types as genai_types
         return genai_types.GenerateContentConfig(
-            max_output_tokens=2048,
+            max_output_tokens=4096,
             temperature=0.3,
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
         )
     except Exception:
         return None

@@ -16,8 +16,12 @@ DOMESTIC_RSS = [
 ]
 
 FOREIGN_RSS = [
-    {"url": "https://feeds.reuters.com/reuters/technologyNews", "source": "Reuters"},
-    {"url": "https://www.cnbc.com/id/19854910/device/rss/rss.html", "source": "CNBC"},
+    # Tech / AI반도체 중심
+    {"url": "https://feeds.reuters.com/reuters/technologyNews", "source": "Reuters Tech"},
+    {"url": "https://www.cnbc.com/id/19854910/device/rss/rss.html", "source": "CNBC Tech"},
+    # Business / 매크로·지정학·증권·금융 중심 (이란, 금리, 연준, 환율 등 포함)
+    {"url": "https://feeds.reuters.com/reuters/businessNews", "source": "Reuters Business"},
+    {"url": "https://feeds.reuters.com/Reuters/worldNews", "source": "Reuters World"},
 ]
 
 
