@@ -1,16 +1,23 @@
-"""Google Gemini AI를 이용한 뉴스 선별·분류·번역 및 시장 분석 모듈."""
+"""Google Gemini AI를 이용한 오전 브리핑 분석 모듈.
+
+단일 Gemini 호출로 아래 항목을 JSON으로 생성합니다:
+  - 시장 기조 (Risk-On / Risk-Off / 혼조)
+  - 포트폴리오 참고 한줄
+  - 핵심 이슈 3선 (스윙 트레이딩 관점 영향 포함)
+  - 오늘의 주도 섹터 (AI 자유 선정, 고정 섹터 없음)
+  - 스윙 트레이딩 체크포인트
+  - 이번 주 주요 경제 일정
+"""
 
 import json
 import logging
 import os
 import re
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-
-from config import SECTORS
 
 load_dotenv()
 
@@ -19,11 +26,10 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 MODEL_NAME = "gemini-2.5-flash"
 
-_SECTOR_NAMES = [s["name"] for s in SECTORS]
 
-REQUIRED_SECTIONS_MORNING = ["■ 핵심 이슈", "■ 시장 방향 예상", "■ 섹터별 주목 종목"]
-REQUIRED_SECTIONS_EVENING = ["■ 핵심 이슈", "■ 미국 시장 방향 예상", "■ 섹터별 주목 종목 (프리마켓)"]
-
+# ---------------------------------------------------------------------------
+# Gemini 클라이언트 / 설정 헬퍼
+# ---------------------------------------------------------------------------
 
 def _get_gemini_client():
     """Gemini API 클라이언트를 반환합니다. API 키 없거나 패키지 미설치 시 None 반환."""
@@ -39,28 +45,11 @@ def _get_gemini_client():
         return None
 
 
-def _make_gen_config():
-    """텍스트 분석용 generation_config 객체를 생성합니다. 패키지 문제 시 None 반환.
-
-    gemini-2.5-flash는 thinking 모델이라 thinking 토큰이 output 한도를 소비합니다.
-    분석 결과가 잘리지 않도록 thinking을 비활성화하고 출력 한도를 충분히 설정합니다.
-    """
-    try:
-        from google.genai import types as genai_types
-        return genai_types.GenerateContentConfig(
-            max_output_tokens=4096,
-            temperature=0.3,
-            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-        )
-    except Exception:
-        return None
-
-
 def _make_json_gen_config():
-    """JSON 응답 강제 generation_config 객체를 생성합니다.
+    """JSON 응답 강제 generation_config.
 
-    gemini-2.5-flash는 thinking 모델이라 thinking 토큰이 output 한도를 소비합니다.
-    JSON 분류 작업에서는 thinking을 비활성화하여 응답 잘림을 방지합니다.
+    gemini-2.5-flash는 thinking 모델 → thinking_budget=0 필수.
+    미설정 시 thinking 토큰이 output 한도를 소비하여 응답이 잘림.
     """
     try:
         from google.genai import types as genai_types
@@ -77,8 +66,7 @@ def _make_json_gen_config():
 def _parse_json_response(raw: str):
     """Gemini 응답에서 JSON을 파싱합니다.
 
-    코드블록 래핑, JS 주석, 트레일링 콤마, 앞뒤 불필요한 텍스트 및
-    Extra data 오류를 자동 처리합니다.
+    코드블록 래핑, JS 주석, 트레일링 콤마, Extra data 오류를 자동 처리합니다.
     """
     raw = raw.strip()
 
@@ -135,147 +123,34 @@ def _parse_json_response(raw: str):
     return json.loads(raw)
 
 
-def _fill_missing_sections(text: str, required: list) -> str:
-    """누락된 필수 섹션을 '정보 없음'으로 채웁니다."""
-    for section in required:
-        if section not in text:
-            text += f"\n\n{section}\n정보 없음"
-    return text
+# ---------------------------------------------------------------------------
+# 메인 분석 함수
+# ---------------------------------------------------------------------------
 
-
-def select_and_classify_news(
+def build_morning_briefing(
     domestic_news: list,
     foreign_news: list,
-    today_str: str,
-    domestic_limit: int = 5,
-    foreign_limit: int = 4,
-) -> Dict[str, List[dict]]:
-    """시장 영향도 기준으로 국내·해외 뉴스를 선별하고 섹터별로 분류합니다.
-
-    해외 뉴스 제목은 한국어로 번역합니다.
-    GEMINI_API_KEY 없으면 빈 딕셔너리를 반환합니다.
-
-    Args:
-        domestic_news: 국내 뉴스 후보 리스트
-        foreign_news: 해외 뉴스 후보 리스트
-        today_str: KST 기준 날짜 문자열
-        domestic_limit: 선별할 국내 뉴스 수
-        foreign_limit: 선별할 해외 뉴스 수
-
-    Returns:
-        {섹터명: [뉴스 딕셔너리, ...], ...} — API 키 없으면 빈 dict
-    """
-    empty_result = {s: [] for s in _SECTOR_NAMES}
-
-    client = _get_gemini_client()
-    if client is None:
-        return empty_result
-
-    # 프롬프트용 섹터 정의 문자열
-    sector_defs = "\n".join(f"- {s['name']}: {s['keywords']}" for s in SECTORS)
-
-    # JSON 응답 예시 (동적 생성)
-    json_example = (
-        "{\n"
-        + ",\n".join(
-            f'  "{s}": [{{"index": 0, "is_foreign": false, "translated_title": "제목 예시", "source": "출처"}}]'
-            for s in _SECTOR_NAMES
-        )
-        + "\n}"
-    )
-
-    domestic_for_prompt = [
-        {"index": i, "title": n["title"], "source": n.get("source", "")}
-        for i, n in enumerate(domestic_news)
-    ]
-    foreign_for_prompt = [
-        {"index": i, "title": n["title"], "source": n.get("source", "")}
-        for i, n in enumerate(foreign_news)
-    ]
-
-    count_rule = ""
-    if domestic_limit > 0:
-        count_rule += f"- 국내 뉴스: 시장 영향도 상위 {domestic_limit}개 선택\n"
-    if foreign_limit > 0:
-        count_rule += f"- 해외 뉴스: 시장 영향도 상위 {foreign_limit}개 선택\n"
-
-    prompt = f"""오늘 날짜는 {today_str}입니다.
-
-당신은 주식 시장 전문 편집자입니다.
-아래 국내·해외 뉴스 후보에서 오늘 주식시장에 가장 큰 영향을 줄 뉴스를 선별하고 섹터별로 분류해주세요.
-
-[선별 규칙]
-{count_rule}- 각 섹터({' · '.join(_SECTOR_NAMES)})에 최소 1개 이상 배분되도록 선택
-- 어느 섹터에도 해당하지 않는 뉴스는 선택하지 않음
-- 해외 뉴스 제목은 자연스러운 한국어로 번역
-
-[섹터 정의]
-{sector_defs}
-
-[국내 뉴스 후보]
-{json.dumps(domestic_for_prompt, ensure_ascii=False)}
-
-[해외 뉴스 후보]
-{json.dumps(foreign_for_prompt, ensure_ascii=False)}
-
-JSON 형식으로만 응답하고 다른 설명은 절대 추가하지 마세요.
-국내 뉴스는 is_foreign: false, 해외 뉴스는 is_foreign: true로 표기하세요:
-{json_example}"""
-
-    try:
-        json_config = _make_json_gen_config()
-        kwargs = {"model": MODEL_NAME, "contents": prompt}
-        if json_config:
-            kwargs["config"] = json_config
-        response = client.models.generate_content(**kwargs)
-        classified = _parse_json_response(response.text)
-
-        result = {s: [] for s in _SECTOR_NAMES}
-        for sector_name in _SECTOR_NAMES:
-            for item in classified.get(sector_name, []):
-                idx = item.get("index")
-                is_foreign = item.get("is_foreign", False)
-                source_list = foreign_news if is_foreign else domestic_news
-                if idx is None or idx >= len(source_list):
-                    continue
-                news_item = source_list[idx].copy()
-                news_item["title"] = item.get("translated_title", news_item["title"])
-                news_item["is_foreign"] = is_foreign
-                result[sector_name].append(news_item)
-
-        counts = ", ".join(f"{s} {len(result[s])}" for s in _SECTOR_NAMES)
-        total = sum(len(v) for v in result.values())
-        logger.info("AI 뉴스 선별·분류 완료: 총 %d건 (%s)", total, counts)
-        return result
-
-    except Exception as e:
-        logger.warning("AI 뉴스 선별·분류 실패: %s", e)
-        try:
-            logger.debug("Gemini 원시 응답 (첫 500자): %s", response.text[:500])
-        except Exception:
-            pass
-        return empty_result
-
-
-def analyze_market(
-    sector_news: Dict[str, List[dict]],
     stocks: dict,
     today_str: Optional[str] = None,
-    message_type: str = "morning",
-) -> Optional[str]:
-    """섹터별 뉴스와 지수 데이터로 시장을 분석합니다.
-
-    필수 섹션이 누락되면 1회 재시도 후 '정보 없음'으로 채워 반환합니다.
-    GEMINI_API_KEY 환경 변수가 없으면 None을 반환합니다.
+) -> Optional[dict]:
+    """오전 브리핑 전체를 단일 Gemini 호출로 분석합니다.
 
     Args:
-        sector_news: select_and_classify_news 반환값 (섹터별 뉴스 딕셔너리)
-        stocks: 오전=지수 딕셔너리, 오후=선물 딕셔너리
-        today_str: KST 기준 날짜 문자열 (없으면 자동 생성)
-        message_type: "morning" 또는 "evening"
+        domestic_news: 국내 뉴스 리스트 (news_collector 반환값)
+        foreign_news:  해외 뉴스 리스트 (news_collector 반환값)
+        stocks:        collect_morning_stocks() 반환값
+        today_str:     KST 기준 날짜 문자열 (없으면 자동 생성)
 
     Returns:
-        AI 분석 결과 문자열, 또는 분석 불가 시 None
+        분석 결과 dict. 키:
+            market_regime   : "Risk-On" | "Risk-Off" | "혼조"
+            regime_summary  : 기조 요약 1~2문장
+            portfolio_note  : 패시브 포트폴리오 한줄 참고
+            key_issues      : [{"icon","category","title","impact"}, ...]  3개
+            leading_sectors : [{"emoji","name","stars","reason","stocks_kr","stocks_us"}, ...]  2~3개
+            swing_check     : {"phase", "catalysts": [...], "risks": [...]}
+            weekly_schedule : [{"date","event","importance"}, ...]  3~5개
+        실패 시 None 반환.
     """
     if today_str is None:
         today_str = datetime.now(KST).strftime("%Y년 %m월 %d일")
@@ -284,150 +159,128 @@ def analyze_market(
     if client is None:
         return None
 
-    required_sections = (
-        REQUIRED_SECTIONS_MORNING if message_type == "morning"
-        else REQUIRED_SECTIONS_EVENING
-    )
-    prompt = (
-        _build_morning_prompt(sector_news, stocks, today_str)
-        if message_type == "morning"
-        else _build_evening_prompt(sector_news, stocks, today_str)
-    )
+    # ── 지수/자산 데이터 텍스트 ──────────────────────────────────────────
+    name_map = {
+        "KOSPI": "코스피", "KOSDAQ": "코스닥",
+        "SP500": "S&P500", "NASDAQ": "나스닥", "DOW": "다우존스",
+        "GOLD": "금(달러/온스)", "DXY": "달러인덱스",
+        "US10Y": "미10년물금리(%)", "USDKRW": "원/달러",
+    }
+    index_keys = ["KOSPI", "KOSDAQ", "SP500", "NASDAQ", "DOW"]
+    macro_keys = ["GOLD", "DXY", "US10Y", "USDKRW"]
 
-    gen_config = _make_gen_config()
+    def _fmt(k, v):
+        sign = "+" if v["change"] >= 0 else ""
+        return f"  {name_map.get(k, k)}: {v['current']:,.4f} ({sign}{v['change_pct']:.2f}%)"
+
+    indices_text = "\n".join(_fmt(k, stocks[k]) for k in index_keys if k in stocks)
+    macro_text   = "\n".join(_fmt(k, stocks[k]) for k in macro_keys if k in stocks)
+
+    # ── 뉴스 텍스트 ─────────────────────────────────────────────────────
+    domestic_text = "\n".join(
+        f"[국내] {n['title']} ({n.get('source', '')})"
+        for n in domestic_news[:30]
+    ) or "(국내 뉴스 없음)"
+
+    foreign_text = "\n".join(
+        f"[해외] {n['title']} ({n.get('source', '')})"
+        for n in foreign_news[:40]
+    ) or "(해외 뉴스 없음)"
+
+    # ── 프롬프트 ────────────────────────────────────────────────────────
+    prompt = f"""오늘 날짜는 {today_str}입니다.
+
+당신은 10년 이상 경력의 한국 주식 시장 전문 애널리스트입니다.
+아래 시장 데이터와 뉴스를 종합하여 오전 투자 브리핑을 작성하세요.
+
+[투자자 프로필]
+- 패시브 포트폴리오: S&P500 ETF 55%, 미국배당다우존스 ETF 25%, 국고채10년 ETF 10%, 금 ETF 10% (장기 분기 리밸런싱)
+- 스윙 트레이딩: 국내(KOSPI 대형주) + 미국(S&P500 상위) 대상, 1~3개월 보유
+
+[주요 지수 (전일 종가)]
+{indices_text or "  (데이터 없음)"}
+
+[매크로 자산 (전일 종가)]
+{macro_text or "  (데이터 없음)"}
+
+[오늘 국내 뉴스]
+{domestic_text}
+
+[오늘 해외 뉴스]
+{foreign_text}
+
+아래 JSON 스키마를 정확히 따라 응답하세요. JSON 이외의 텍스트는 절대 포함하지 마세요:
+
+{{
+  "market_regime": "Risk-On 또는 Risk-Off 또는 혼조",
+  "regime_summary": "오늘 시장 기조를 1~2문장으로 요약",
+  "portfolio_note": "패시브 포트폴리오 4개 자산 중 오늘 특이 동향 한줄 (예: 금 ETF 강세 유지 / 채권 관망)",
+  "key_issues": [
+    {{
+      "icon": "🔴 또는 🟡 또는 🟢 (🔴=하락 리스크, 🟡=중립/혼조, 🟢=상승 모멘텀)",
+      "category": "분류 (예: 지정학, 통화정책, 실적, 무역, 경제지표, 에너지, 기술)",
+      "title": "이슈 제목 (한국어, 간결하게)",
+      "impact": "스윙 트레이딩 관점 영향 1문장 (어떤 섹터/종목에 어떤 영향)"
+    }}
+  ],
+  "leading_sectors": [
+    {{
+      "emoji": "섹터 특성에 맞는 이모지",
+      "name": "섹터명",
+      "stars": "★★★ 또는 ★★☆ 또는 ★☆☆",
+      "reason": "오늘 이 섹터가 주도하는 근거 (뉴스 기반, 1~2문장)",
+      "stocks_kr": "국내 주목 대형주 종목명 (없으면 빈 문자열)",
+      "stocks_us": "미국 주목 대형주 종목명 (없으면 빈 문자열)"
+    }}
+  ],
+  "swing_check": {{
+    "phase": "현재 시장 국면 한줄 (예: 하락 추세 속 기술적 반등 시도)",
+    "catalysts": ["향후 1~2주 내 주요 촉매제 (날짜 포함)", "..."],
+    "risks": ["주요 하방 리스크", "..."]
+  }},
+  "weekly_schedule": [
+    {{
+      "date": "MM/DD(요일)",
+      "event": "경제지표·실적·정책회의 등 일정명",
+      "importance": 1
+    }}
+  ]
+}}
+
+[작성 규칙]
+- key_issues: 정확히 3개, 시장 영향력 큰 순서로 배열
+- leading_sectors: 2~3개, 오늘 뉴스에서 실제 움직임이 확인되는 섹터만 선정 (고정 섹터 없음)
+- weekly_schedule: 오늘 이후 이번 주 남은 날짜 기준 3~5개, importance는 1(일반)·2(중요)·3(매우중요)
+- 투자 권유 표현 절대 금지 ("매수하세요", "추천합니다" 등)
+- 인사말·서문·결론 문구 금지"""
+
+    # ── Gemini 호출 (최대 2회 시도) ─────────────────────────────────────
+    json_config = _make_json_gen_config()
     kwargs = {"model": MODEL_NAME, "contents": prompt}
-    if gen_config:
-        kwargs["config"] = gen_config
+    if json_config:
+        kwargs["config"] = json_config
 
-    result = None
+    last_response_text = None
     for attempt in range(2):
         try:
             response = client.models.generate_content(**kwargs)
-            result = response.text.strip()
-            missing = [s for s in required_sections if s not in result]
-            if not missing:
-                logger.info("Gemini 시장 분석 완료 (%d자)", len(result))
-                return result
-            logger.warning("[시도 %d] 누락된 섹션: %s. 재시도합니다.", attempt + 1, missing)
+            last_response_text = response.text
+            result = _parse_json_response(response.text)
+
+            # 필수 키 검증
+            required = ["market_regime", "key_issues", "leading_sectors", "swing_check", "weekly_schedule"]
+            missing = [k for k in required if k not in result]
+            if missing:
+                logger.warning("[시도 %d] 누락된 키: %s. 재시도합니다.", attempt + 1, missing)
+                continue
+
+            logger.info("오전 브리핑 AI 분석 완료 (%d자)", len(response.text))
+            return result
+
         except Exception as e:
-            logger.error("[시도 %d] Gemini 호출 오류: %s", attempt + 1, e)
+            logger.error("[시도 %d] Gemini 오전 브리핑 분석 실패: %s", attempt + 1, e)
+            if last_response_text:
+                logger.debug("응답 원시 텍스트 (첫 500자): %s", last_response_text[:500])
 
-    logger.error("Gemini 분석 2회 모두 실패. 가용 내용으로 전송합니다.")
-    if result:
-        return _fill_missing_sections(result, required_sections)
+    logger.error("Gemini 분석 2회 모두 실패.")
     return None
-
-
-def _news_text_for_prompt(news_list: list) -> str:
-    """뉴스 리스트를 프롬프트용 텍스트로 변환합니다."""
-    if not news_list:
-        return "(관련 뉴스 없음)"
-    return "\n".join(
-        f"- {'[해외] ' if item.get('is_foreign') else '[국내] '}{item['title']} ({item.get('source', '')})"
-        for item in news_list
-    )
-
-
-def _build_morning_prompt(sector_news: dict, stocks: dict, today_str: str) -> str:
-    """오전 시장 분석 프롬프트를 생성합니다."""
-    news_sections = "\n\n".join(
-        f"[{s['name']} 뉴스]\n{_news_text_for_prompt(sector_news.get(s['name'], []))}"
-        for s in SECTORS
-    )
-    sector_format = "\n".join(
-        f'{s["name"]}: 기업명 [거래소] — 선정 이유  (없으면 "없음")'
-        for s in SECTORS
-    )
-    name_map = {"KOSPI": "코스피", "KOSDAQ": "코스닥", "SP500": "S&P 500", "NASDAQ": "나스닥", "DOW": "다우존스"}
-    stocks_text = "\n".join(
-        f"- {name_map.get(k, k)}: {v['current']:,.2f} ({'+'if v['change'] >= 0 else ''}{v['change_pct']:.2f}%)"
-        for k, v in stocks.items()
-    )
-
-    return f"""오늘 날짜는 {today_str}입니다.
-
-당신은 한국 주식 시장 분석 전문가입니다.
-아래 데이터를 바탕으로 시장을 분석해주세요.
-
-[절대 규칙]
-- 인사말·서문·결론 문구 절대 사용 금지
-- 반드시 아래 3개 섹션을 모두 포함할 것:
-    ■ 핵심 이슈
-    ■ 시장 방향 예상
-    ■ 섹터별 주목 종목
-- 각 섹션 제목은 정확히 위 표기대로 사용
-- 3개 섹션 중 하나라도 누락하면 응답이 유효하지 않음
-- 투자 권유 표현 사용 금지
-
-[출력 형식]
-■ 핵심 이슈
-(오늘의 핵심 경제 이슈 2~3줄 요약)
-
-■ 시장 방향 예상
-(단기 시장 방향 예상 1~2줄)
-
-■ 섹터별 주목 종목
-{sector_format}
-
-[종목 선정 규칙]
-- 주도기업 우선, 불명확 시 시가총액 상위 기업 순
-- AI반도체는 글로벌 기업(엔비디아, TSMC, ASML 등) 또는 국내 반도체 기업(삼성전자, SK하이닉스 등) 중심
-- 거래소 표기 필수: [KOSPI], [KOSDAQ], [NASDAQ], [NYSE]
-- 반드시 모든 섹터를 표기할 것. 추천할 종목이 없으면 "없음" (섹터 줄 자체 생략 금지)
-
-{news_sections}
-
-[주요 지수]
-{stocks_text}"""
-
-
-def _build_evening_prompt(sector_news: dict, futures: dict, today_str: str) -> str:
-    """오후 미국 시장 프리뷰 분석 프롬프트를 생성합니다."""
-    sector_news_blocks = "\n\n".join(
-        f"[{s['name']} 해외 뉴스]\n{_news_text_for_prompt(sector_news.get(s['name'], []))}"
-        for s in SECTORS
-    )
-    sector_format = "\n".join(
-        f'{s["name"]}: 기업명 [거래소] — 선정 이유  (이슈 없으면 "없음")'
-        for s in SECTORS
-    )
-    futures_text = "\n".join(
-        f"- {name}: {data['price']:,.2f} ({'+'if data['change'] >= 0 else ''}{data['pct']:.2f}%)"
-        for name, data in futures.items()
-    ) or "(데이터 없음)"
-
-    return f"""오늘 날짜는 {today_str}입니다.
-
-당신은 미국 주식 시장 분석 전문가입니다.
-아래 해외 뉴스와 선물 지수 데이터를 바탕으로 오늘 밤 미국 시장을 분석해주세요.
-
-[절대 규칙]
-- 인사말·서문·결론 문구 절대 사용 금지
-- 반드시 아래 3개 섹션을 모두 포함할 것:
-    ■ 핵심 이슈
-    ■ 미국 시장 방향 예상
-    ■ 섹터별 주목 종목 (프리마켓)
-- 각 섹션 제목은 정확히 위 표기대로 사용
-- 3개 섹션 중 하나라도 누락하면 응답이 유효하지 않음
-- 투자 권유 표현 사용 금지
-
-[출력 형식]
-■ 핵심 이슈
-(해외 뉴스 기반 오늘 밤 핵심 이슈 2~3줄)
-
-■ 미국 시장 방향 예상
-(오늘 밤 미국 장 방향 예상 1~2줄)
-
-■ 섹터별 주목 종목 (프리마켓)
-{sector_format}
-
-[종목 선정 규칙]
-- 주도기업 우선, 불명확 시 시가총액 상위 기업 순
-- AI반도체는 글로벌 기업(엔비디아, TSMC, ASML 등) 중심
-- 거래소 표기 필수: [NASDAQ], [NYSE], [KOSPI], [KOSDAQ]
-- 반드시 모든 섹터를 표기할 것. 이슈 없으면 "없음" (섹터 줄 자체 생략 금지)
-
-{sector_news_blocks}
-
-[미국 선물 지수]
-{futures_text}"""
