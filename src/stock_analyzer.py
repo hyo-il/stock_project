@@ -170,3 +170,58 @@ def _collect_macro_assets() -> dict:
             logger.warning("%s 수집 실패 (%s): %s", name, ticker, e)
 
     return result
+
+
+def _collect_vix() -> dict:
+    """yfinance로 VIX 공포지수를 수집합니다.
+
+    Returns:
+        {"VIX": {"current": float, "change": float, "change_pct": float, "data_date": str}}
+        수집 실패 시 빈 dict.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        logger.warning("yfinance 패키지가 설치되지 않았습니다.")
+        return {}
+
+    try:
+        df = yf.Ticker("^VIX").history(period="5d")
+        if df.empty or len(df) < 2:
+            logger.warning("VIX 데이터가 충분하지 않습니다.")
+            return {}
+
+        current = float(df["Close"].iloc[-1])
+        previous = float(df["Close"].iloc[-2])
+        change = round(current - previous, 2)
+        change_pct = round((change / previous) * 100, 2) if previous != 0 else 0.0
+
+        logger.info("VIX 수집 완료: %.2f (%.2f%%)", current, change_pct)
+        return {
+            "VIX": {
+                "current":    round(current, 2),
+                "change":     change,
+                "change_pct": change_pct,
+                "data_date":  _format_data_date(df.index[-1]),
+            }
+        }
+    except Exception as e:
+        logger.warning("VIX 수집 실패: %s", e)
+        return {}
+
+
+def collect_afternoon_stocks() -> dict:
+    """오후 알림용: 국내 지수 + VIX 데이터를 수집합니다.
+
+    Returns:
+        {
+            "KOSPI":  {"current": float, "change": float, "change_pct": float, "data_date": str},
+            "KOSDAQ": {"current": float, "change": float, "change_pct": float, "data_date": str},
+            "VIX":    {"current": float, "change": float, "change_pct": float, "data_date": str},
+        }
+        수집 실패 항목은 결과에서 제외.
+    """
+    result = {}
+    result.update(_collect_korean_indices())
+    result.update(_collect_vix())
+    return result

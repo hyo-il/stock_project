@@ -3,7 +3,17 @@ name: 주식 정보 자동 알림
 on:
   schedule:
     - cron: '0 22 * * 0-4'   # UTC 일~목 22:00 → KST 월~금 07:00 오전 브리핑
-  workflow_dispatch:         # 수동 실행 버튼
+    - cron: '40 6 * * 1-5'   # UTC 월~금 06:40 → KST 월~금 15:40 오후 브리핑
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '실행 모드 선택'
+        required: true
+        default: 'morning'
+        type: choice
+        options:
+          - morning
+          - afternoon
 
 concurrency:
   group: stock-alert
@@ -22,9 +32,23 @@ jobs:
       - name: 패키지 설치
         run: pip install -r requirements.txt
 
+      - name: 실행 모드 결정
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUN_MODE=${{ github.event.inputs.mode }}" >> $GITHUB_ENV
+          else
+            HOUR=$(TZ=Asia/Seoul date +%H)
+            if [ "$HOUR" -lt 13 ]; then
+              echo "RUN_MODE=morning" >> $GITHUB_ENV
+            else
+              echo "RUN_MODE=afternoon" >> $GITHUB_ENV
+            fi
+          fi
+
       - name: 주식 알림 실행
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          RUN_MODE: ${{ env.RUN_MODE }}
         run: python src/main.py
