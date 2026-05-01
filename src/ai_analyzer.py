@@ -146,10 +146,10 @@ def build_morning_briefing(
             market_regime   : "Risk-On" | "Risk-Off" | "혼조"
             regime_summary  : 기조 요약 1~2문장
             portfolio_note  : 패시브 포트폴리오 한줄 참고
-            key_issues      : [{"icon","category","title","impact"}, ...]  3개
+            key_issues      : [{"icon","category","title","why_important","swing_point"}, ...]  3개
             leading_sectors : [{"emoji","name","stars","reason","stocks_kr","stocks_us"}, ...]  2~3개
             swing_check     : {"phase", "catalysts": [...], "risks": [...]}
-            weekly_schedule : [{"date","event","importance"}, ...]  3~5개
+            weekly_schedule : [{"date","event","detail","importance"}, ...]  3~5개
         실패 시 None 반환.
     """
     if today_str is None:
@@ -171,7 +171,9 @@ def build_morning_briefing(
 
     def _fmt(k, v):
         sign = "+" if v["change"] >= 0 else ""
-        return f"  {name_map.get(k, k)}: {v['current']:,.4f} ({sign}{v['change_pct']:.2f}%)"
+        date_str = v.get("data_date", "")
+        date_suffix = f" [{date_str} 종가]" if date_str else ""
+        return f"  {name_map.get(k, k)}: {v['current']:,.4f} ({sign}{v['change_pct']:.2f}%){date_suffix}"
 
     indices_text = "\n".join(_fmt(k, stocks[k]) for k in index_keys if k in stocks)
     macro_text   = "\n".join(_fmt(k, stocks[k]) for k in macro_keys if k in stocks)
@@ -218,9 +220,10 @@ def build_morning_briefing(
   "key_issues": [
     {{
       "icon": "🔴 또는 🟡 또는 🟢 (🔴=하락 리스크, 🟡=중립/혼조, 🟢=상승 모멘텀)",
-      "category": "분류 (예: 지정학, 통화정책, 실적, 무역, 경제지표, 에너지, 기술)",
+      "category": "분류 (예: 실적, 지정학, 통화정책, 무역, 경제지표, 에너지, 기술)",
       "title": "이슈 제목 (한국어, 간결하게)",
-      "impact": "스윙 트레이딩 관점 영향 1문장 (어떤 섹터/종목에 어떤 영향)"
+      "why_important": "왜 중요한지 — 투자 초보자도 이해할 수 있는 1문장",
+      "swing_point": "스윙 트레이딩 관점 포인트 — 어떤 섹터/종목에 어떤 영향인지 구체적으로"
     }}
   ],
   "leading_sectors": [
@@ -242,17 +245,28 @@ def build_morning_briefing(
     {{
       "date": "MM/DD(요일)",
       "event": "경제지표·실적·정책회의 등 일정명",
+      "detail": "기업명+예상EPS/이전값 등 구체 정보 (없으면 빈 문자열)",
       "importance": 1
     }}
   ]
 }}
 
 [작성 규칙]
-- key_issues: 정확히 3개, 시장 영향력 큰 순서로 배열
-- leading_sectors: 2~3개, 오늘 뉴스에서 실제 움직임이 확인되는 섹터만 선정 (고정 섹터 없음)
-- weekly_schedule: 오늘 이후 이번 주 남은 날짜 기준 3~5개, importance는 1(일반)·2(중요)·3(매우중요)
-- 투자 권유 표현 절대 금지 ("매수하세요", "추천합니다" 등)
-- 인사말·서문·결론 문구 금지"""
+- 데이터 기준일 인식: 위 [주요 지수]·[매크로 자산]에 표시된 [MM/DD(요일) 종가] 라벨을 반드시 인식하고,
+  현재 시점(브리핑 작성 시각)이 해당 종가 이후임을 전제로 어조를 조정하세요.
+  예: "강세를 보이고 있습니다" → "금요일 강세 마감", "오르는 중입니다" → "전 거래일 상승 마감".
+  미국 지수가 금요일 종가라면 "주말 휴장 후 월요일 개장 주목" 식으로 표현 가능.
+- key_issues: 정확히 3개, 시장 영향력 큰 순서로 배열.
+  ★ 실적 발표 뉴스(개별 기업 어닝/가이던스)는 최우선으로 1번 또는 2번 슬롯에 배치.
+  why_important는 초보자도 이해할 수 있게 평이한 표현 사용.
+  금융 전문용어가 불가피하면 괄호로 짧게 풀이 병기 (예: "FOMC(미 연준 통화정책 회의)", "EPS(주당순이익)").
+  swing_point는 "어떤 섹터의 어떤 종목군이 수혜/타격"인지 구체적으로 명시.
+- leading_sectors: 2~3개, 오늘 뉴스에서 실제 움직임이 확인되는 섹터만 선정 (고정 섹터 없음).
+- weekly_schedule: 오늘 이후 이번 주 남은 날짜 기준 3~5개, importance는 1(일반)·2(중요)·3(매우중요).
+  실적 발표 일정은 detail에 "기업명 (예상 EPS $X.XX vs 전년 $Y.YY)" 식 구체 정보 포함.
+  지표 발표는 detail에 "예상치 X.X% vs 이전 Y.Y%" 식 포함. 알 수 없으면 빈 문자열.
+- 투자 권유 표현 절대 금지 ("매수하세요", "추천합니다" 등).
+- 인사말·서문·결론 문구 금지."""
 
     # ── Gemini 호출 (최대 2회 시도) ─────────────────────────────────────
     json_config = _make_json_gen_config()

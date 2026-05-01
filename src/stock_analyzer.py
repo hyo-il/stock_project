@@ -8,33 +8,40 @@ logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 
+_WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def _format_data_date(date_obj) -> str:
+    """yfinance/FDR index 값에서 'MM/DD(요일)' 문자열을 생성합니다."""
+    try:
+        d = date_obj.date() if hasattr(date_obj, "date") else date_obj
+        return f"{d.month:02d}/{d.day:02d}({_WEEKDAY_KR[d.weekday()]})"
+    except Exception:
+        return ""
+
 
 def collect_morning_stocks() -> dict:
     """오전 알림용: 국내외 주요 지수 + 매크로 자산 데이터를 수집합니다.
 
     Returns:
         {
-            "KOSPI":  {"current": float, "change": float, "change_pct": float},
-            "KOSDAQ": {"current": float, "change": float, "change_pct": float},
-            "SP500":  {"current": float, "change": float, "change_pct": float},
-            "NASDAQ": {"current": float, "change": float, "change_pct": float},
-            "DOW":    {"current": float, "change": float, "change_pct": float},
-            "GOLD":   {"current": float, "change": float, "change_pct": float},
-            "DXY":    {"current": float, "change": float, "change_pct": float},
-            "US10Y":  {"current": float, "change": float, "change_pct": float},
-            "USDKRW": {"current": float, "change": float, "change_pct": float},
+            "KOSPI":  {"current": float, "change": float, "change_pct": float, "data_date": str},
+            "KOSDAQ": {"current": float, "change": float, "change_pct": float, "data_date": str},
+            "SP500":  {"current": float, "change": float, "change_pct": float, "data_date": str},
+            "NASDAQ": {"current": float, "change": float, "change_pct": float, "data_date": str},
+            "DOW":    {"current": float, "change": float, "change_pct": float, "data_date": str},
+            "GOLD":   {"current": float, "change": float, "change_pct": float, "data_date": str},
+            "DXY":    {"current": float, "change": float, "change_pct": float, "data_date": str},
+            "US10Y":  {"current": float, "change": float, "change_pct": float, "data_date": str},
+            "USDKRW": {"current": float, "change": float, "change_pct": float, "data_date": str},
         }
-        수집 실패 시 해당 항목은 포함되지 않습니다.
+        data_date: 실제 데이터 기준일 문자열 (예: "04/25(금)"). 수집 실패 시 해당 항목 제외.
     """
     result = {}
     result.update(_collect_korean_indices())
     result.update(_collect_us_indices())
     result.update(_collect_macro_assets())
     return result
-
-
-# 하위 호환 별칭
-collect_stock_data = collect_morning_stocks
 
 
 def _collect_korean_indices() -> dict:
@@ -66,7 +73,12 @@ def _collect_korean_indices() -> dict:
             change = round(current - previous, 2)
             change_pct = round((change / previous) * 100, 2)
 
-            result[name] = {"current": round(current, 2), "change": change, "change_pct": change_pct}
+            result[name] = {
+                "current": round(current, 2),
+                "change": change,
+                "change_pct": change_pct,
+                "data_date": _format_data_date(df.index[-1]),
+            }
             logger.info("%s 수집 완료: %.2f (%.2f%%)", name, current, change_pct)
         except Exception as e:
             logger.warning("%s 수집 실패: %s", name, e)
@@ -97,7 +109,12 @@ def _collect_us_indices() -> dict:
             change = round(current - previous, 2)
             change_pct = round((change / previous) * 100, 2)
 
-            result[name] = {"current": round(current, 2), "change": change, "change_pct": change_pct}
+            result[name] = {
+                "current": round(current, 2),
+                "change": change,
+                "change_pct": change_pct,
+                "data_date": _format_data_date(df.index[-1]),
+            }
             logger.info("%s 수집 완료: %.2f (%.2f%%)", name, current, change_pct)
         except Exception as e:
             logger.warning("%s 수집 실패: %s", name, e)
@@ -146,6 +163,7 @@ def _collect_macro_assets() -> dict:
                 "current": round(current, 4),
                 "change": change,
                 "change_pct": change_pct,
+                "data_date": _format_data_date(df.index[-1]),
             }
             logger.info("%s 수집 완료: %.4f (%.2f%%)", name, current, change_pct)
         except Exception as e:

@@ -16,8 +16,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-sys.path.insert(0, "src")
-
 from ai_analyzer import build_morning_briefing
 from news_collector import collect_all_news
 from stock_analyzer import collect_morning_stocks
@@ -134,8 +132,17 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
     lines.append("")
 
     # ── ② 주요 지수 & 매크로 자산 ─────────────────────────────────────
+    us_data_date = stocks.get("SP500", {}).get("data_date", "")
+    kr_data_date = stocks.get("KOSPI", {}).get("data_date", "")
+
+    date_note = ""
+    if us_data_date and kr_data_date and us_data_date != kr_data_date:
+        date_note = f"  <i>※ 국내 {kr_data_date} / 미국 {us_data_date} 종가 기준</i>"
+    elif us_data_date:
+        date_note = f"  <i>※ {us_data_date} 종가 기준</i>"
+
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append("📈 <b>주요 지수</b>")
+    lines.append(f"📈 <b>주요 지수</b>{date_note}")
 
     index_cfg = [
         ("KOSPI",  "🇰🇷 KOSPI "),
@@ -203,10 +210,14 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
             icon = issue.get("icon", "•")
             category = issue.get("category", "")
             title = _safe_html(issue.get("title", ""))
-            impact = _safe_html(issue.get("impact", ""))
+            why = _safe_html(issue.get("why_important", issue.get("impact", "")))
+            swing = _safe_html(issue.get("swing_point", ""))
+
             lines.append(f"{icon} [{category}] {title}")
-            if impact:
-                lines.append(f"  → {impact}")
+            if why:
+                lines.append(f"  📌 {why}")
+            if swing:
+                lines.append(f"  🎯 {swing}")
         lines.append("")
 
     # ── ④ 오늘의 주도 섹터 ───────────────────────────────────────────────
@@ -263,9 +274,12 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
         for item in schedule:
             date = item.get("date", "")
             event = _safe_html(item.get("event", ""))
+            detail = _safe_html(item.get("detail", ""))
             importance = item.get("importance", 1)
             stars_str = star_map.get(importance, "")
             lines.append(f"• {date} {event}{stars_str}")
+            if detail:
+                lines.append(f"  {detail}")
         lines.append("")
 
     lines.append("⚠️ 본 정보는 투자 권유가 아니며 투자 판단의 책임은 본인에게 있습니다.")
