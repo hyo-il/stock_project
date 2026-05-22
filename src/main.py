@@ -206,12 +206,18 @@ def _run_afternoon(today_str: str) -> None:
 # ---------------------------------------------------------------------------
 
 def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
-    """오전 브리핑 텔레그램 HTML 메시지를 포맷팅합니다.
+    """오전 브리핑 텔레그램 HTML 메시지를 포맷팅합니다 (오선 스타일).
 
     구조:
         헤더
         ① 시장 기조 + 포트폴리오 참고 한줄
-        ② 미국 주요 지수 & 매크로 자산 (국내 지수 제외)
+        ② 시장 데이터 (오선 스타일 카테고리 분류)
+           [미국 증시] S&P500 / 나스닥100 / 다우 / 러셀2000
+           [미국 국채] 2년 수익률 / 10년 수익률
+           [달러 인덱스]
+           [골드]
+           [에너지] WTI / 천연가스
+           [원/달러]
         ③ 핵심 이슈 3선
         ④ 오늘의 주도 섹터
         ⑤ 스윙 트레이딩 체크포인트
@@ -222,7 +228,9 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
     day_kr = _DAY_KR.get(now_kst.strftime("%a"), "")
     lines = [f"📊 <b>{today_str}({day_kr}) 오전 브리핑</b>", ""]
 
-    # ── ① 시장 기조 ──────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # ① 시장 기조
+    # ─────────────────────────────────────────────────────────────────────
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     if briefing:
         regime = briefing.get("market_regime", "")
@@ -239,59 +247,96 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
         lines.append("📍 시장 기조 분석 불가")
     lines.append("")
 
-    # ── ② 미국 주요 지수 & 매크로 자산 ──────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # ② 시장 데이터 (오선 스타일)
+    # ─────────────────────────────────────────────────────────────────────
     us_data_date = stocks.get("SP500", {}).get("data_date", "")
     date_note = f"  <i>※ {us_data_date} 종가 기준</i>" if us_data_date else ""
-
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📈 <b>미국 주요 지수</b>{date_note}")
 
-    index_cfg = [
-        ("SP500",  "🇺🇸 S&amp;P500"),
-        ("NASDAQ", "🇺🇸 NASDAQ"),
-        ("DOW",    "🇺🇸 DOW   "),
+    def _prev(info: dict) -> float:
+        """이전 값 = 현재값 - 변동폭"""
+        return info["current"] - info["change"]
+
+    def _arrow(change: float) -> str:
+        return "▲" if change >= 0 else "▼"
+
+    # ── [미국 증시] ──────────────────────────────────────────────────────
+    lines.append(f"<b>[미국 증시]</b>{date_note}")
+    us_index_cfg = [
+        ("SP500",       "S&amp;P500"),
+        ("NASDAQ",      "나스닥100"),
+        ("DOW",         "다우"),
+        ("RUSSELL2000", "러셀2000"),
     ]
-    for key, label in index_cfg:
+    for key, label in us_index_cfg:
         if key in stocks:
             info = stocks[key]
-            arrow = "▲" if info["change"] >= 0 else "▼"
-            sign = "+" if info["change"] >= 0 else ""
+            sign = "+" if info["change_pct"] >= 0 else ""
             lines.append(
-                f"{label}  {info['current']:>10,.2f}  "
-                f"{arrow} {sign}{info['change_pct']:.2f}%"
+                f"{label} {sign}{info['change_pct']:.2f}% → {info['current']:,.2f}"
             )
-
     lines.append("")
-    lines.append("💹 <b>매크로 자산</b>")
 
-    macro_cfg = [
-        ("GOLD",   "🥇 금(달러) ", 2, ""),
-        ("DXY",    "💵 달러인덱스", 3, ""),
-        ("US10Y",  "📈 미10년물  ", 3, "%"),
-        ("USDKRW", "💱 원/달러  ", 2, "원"),
-    ]
-    for key, label, decimals, unit in macro_cfg:
-        if key in stocks:
+    # ── [미국 국채] ──────────────────────────────────────────────────────
+    rate_items = [(k, lbl) for k, lbl in [("US2Y", "2년 수익률"), ("US10Y", "10년 수익률")]
+                  if k in stocks]
+    if rate_items:
+        lines.append("<b>[미국 국채]</b>")
+        for key, label in rate_items:
             info = stocks[key]
-            current = info["current"]
-            change = info["change"]
-            change_pct = info["change_pct"]
-            arrow = "▲" if change >= 0 else "▼"
-            sign = "+" if change >= 0 else ""
-            fmt = f"{{:>10,.{decimals}f}}"
+            prev = _prev(info)
+            lines.append(
+                f"{label} {prev:.3f}% → {info['current']:.3f}%  {_arrow(info['change'])}"
+            )
+        lines.append("")
 
-            if key == "US10Y":
-                lines.append(
-                    f"{label}  {fmt.format(current)}{unit}  "
-                    f"{arrow} {sign}{change:.3f}%p"
-                )
-            else:
-                lines.append(
-                    f"{label}  {fmt.format(current)}{unit}  "
-                    f"{arrow} {sign}{change_pct:.2f}%"
-                )
-    lines.append("")
+    # ── [달러 인덱스] ────────────────────────────────────────────────────
+    if "DXY" in stocks:
+        info = stocks["DXY"]
+        prev = _prev(info)
+        lines.append("<b>[달러 인덱스]</b>")
+        lines.append(f"{prev:.3f} → {info['current']:.3f}  {_arrow(info['change'])}")
+        lines.append("")
 
+    # ── [골드] ───────────────────────────────────────────────────────────
+    if "GOLD" in stocks:
+        info = stocks["GOLD"]
+        prev = _prev(info)
+        lines.append("<b>[골드]</b>")
+        lines.append(f"{prev:,.2f} → {info['current']:,.2f}  {_arrow(info['change'])}")
+        lines.append("")
+
+    # ── [에너지] ─────────────────────────────────────────────────────────
+    energy_items = [(k, lbl, d) for k, lbl, d in
+                    [("WTI", "WTI", 2), ("NATGAS", "천연가스", 3)]
+                    if k in stocks]
+    if energy_items:
+        lines.append("<b>[에너지]</b>")
+        for key, label, decimals in energy_items:
+            info = stocks[key]
+            prev = _prev(info)
+            fmt = f"{{:.{decimals}f}}"
+            lines.append(
+                f"{label} {fmt.format(prev)} → {fmt.format(info['current'])}  {_arrow(info['change'])}"
+            )
+        lines.append("")
+
+    # ── [원/달러] ────────────────────────────────────────────────────────
+    if "USDKRW" in stocks:
+        info = stocks["USDKRW"]
+        prev = _prev(info)
+        sign = "+" if info["change_pct"] >= 0 else ""
+        lines.append("<b>[원/달러]</b>")
+        lines.append(
+            f"{prev:,.2f} → {info['current']:,.2f}원  "
+            f"{_arrow(info['change'])} {sign}{info['change_pct']:.2f}%"
+        )
+        lines.append("")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # AI 분석 없을 때 조기 종료
+    # ─────────────────────────────────────────────────────────────────────
     if not briefing:
         lines.append("⚠️ AI 분석을 불러올 수 없습니다.")
         lines.append("")
@@ -388,12 +433,14 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
 # ---------------------------------------------------------------------------
 
 def format_afternoon_message(stocks: dict, briefing, today_str: str) -> str:
-    """오후 브리핑 텔레그램 HTML 메시지를 포맷팅합니다.
+    """오후 브리핑 텔레그램 HTML 메시지를 포맷팅합니다 (오선 스타일).
 
     구조:
         헤더
-        ① 오늘 시장 총평 + VIX + 포트폴리오 한줄
-        ② 국내 지수 (KOSPI / KOSDAQ)
+        ① 오늘 시장 총평 + VIX 코멘트 + 포트폴리오 한줄
+        ② 시장 데이터 (오선 스타일)
+           [국내 지수] KOSPI / KOSDAQ
+           [공포지수] VIX
         ③ 핵심 이슈 3선
         ④ 오늘의 주도 섹터
         ⑤ 스윙 트레이딩 체크포인트
@@ -404,7 +451,9 @@ def format_afternoon_message(stocks: dict, briefing, today_str: str) -> str:
     day_kr = _DAY_KR.get(now_kst.strftime("%a"), "")
     lines = [f"📊 <b>{today_str}({day_kr}) 오후 브리핑</b>", ""]
 
-    # ── ① 시장 총평 & VIX ────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # ① 시장 총평 & VIX 코멘트
+    # ─────────────────────────────────────────────────────────────────────
     lines.append("━━━━━━━━━━━━━━━━━━━━")
     if briefing:
         summary = briefing.get("market_summary", "")
@@ -421,47 +470,50 @@ def format_afternoon_message(stocks: dict, briefing, today_str: str) -> str:
         lines.append("📍 시장 총평 분석 불가")
     lines.append("")
 
-    # ── ② 국내 지수 ──────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # ② 시장 데이터 (오선 스타일)
+    # ─────────────────────────────────────────────────────────────────────
     kr_data_date = stocks.get("KOSPI", {}).get("data_date", "")
     date_note = f"  <i>※ {kr_data_date} 종가 기준</i>" if kr_data_date else ""
-
     lines.append("━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📈 <b>국내 지수</b>{date_note}")
 
-    index_cfg = [
-        ("KOSPI",  "🇰🇷 KOSPI "),
-        ("KOSDAQ", "🇰🇷 KOSDAQ"),
-    ]
-    for key, label in index_cfg:
+    def _prev(info: dict) -> float:
+        return info["current"] - info["change"]
+
+    def _arrow(change: float) -> str:
+        return "▲" if change >= 0 else "▼"
+
+    # ── [국내 지수] ──────────────────────────────────────────────────────
+    lines.append(f"<b>[국내 지수]</b>{date_note}")
+    for key, label in [("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")]:
         if key in stocks:
             info = stocks[key]
-            arrow = "▲" if info["change"] >= 0 else "▼"
-            sign = "+" if info["change"] >= 0 else ""
+            sign = "+" if info["change_pct"] >= 0 else ""
             lines.append(
-                f"{label}  {info['current']:>10,.2f}  "
-                f"{arrow} {sign}{info['change_pct']:.2f}%"
+                f"{label} {sign}{info['change_pct']:.2f}% → {info['current']:,.2f}"
             )
+    lines.append("")
 
-    # VIX 수치 표시
+    # ── [공포지수] ───────────────────────────────────────────────────────
     vix_info = stocks.get("VIX", {})
     if vix_info:
         vix_val = vix_info["current"]
-        vix_chg = vix_info["change"]
-        vix_pct = vix_info["change_pct"]
-        arrow = "▲" if vix_chg >= 0 else "▼"
-        sign = "+" if vix_chg >= 0 else ""
+        prev_vix = round(_prev(vix_info), 2)
         if vix_val >= 30:
-            vix_label = "😱 VIX(공포)"
+            vix_label = "😱 VIX (공포 구간)"
         elif vix_val >= 20:
-            vix_label = "😟 VIX(주의)"
+            vix_label = "😟 VIX (주의 구간)"
         else:
-            vix_label = "😊 VIX(안정)"
+            vix_label = "😊 VIX (안정 구간)"
+        lines.append("<b>[공포지수]</b>")
         lines.append(
-            f"{vix_label}  {vix_val:>10.2f}  "
-            f"{arrow} {sign}{vix_pct:.2f}%"
+            f"{vix_label}  {prev_vix:.2f} → {vix_val:.2f}  {_arrow(vix_info['change'])}"
         )
-    lines.append("")
+        lines.append("")
 
+    # ─────────────────────────────────────────────────────────────────────
+    # AI 분석 없을 때 조기 종료
+    # ─────────────────────────────────────────────────────────────────────
     if not briefing:
         lines.append("⚠️ AI 분석을 불러올 수 없습니다.")
         lines.append("")

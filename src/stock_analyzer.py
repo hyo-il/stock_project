@@ -21,26 +21,31 @@ def _format_data_date(date_obj) -> str:
 
 
 def collect_morning_stocks() -> dict:
-    """오전 알림용: 국내외 주요 지수 + 매크로 자산 데이터를 수집합니다.
+    """오전 알림용: 국내외 주요 지수 + 매크로 자산 + 에너지 데이터를 수집합니다.
 
     Returns:
         {
-            "KOSPI":  {"current": float, "change": float, "change_pct": float, "data_date": str},
-            "KOSDAQ": {"current": float, "change": float, "change_pct": float, "data_date": str},
-            "SP500":  {"current": float, "change": float, "change_pct": float, "data_date": str},
-            "NASDAQ": {"current": float, "change": float, "change_pct": float, "data_date": str},
-            "DOW":    {"current": float, "change": float, "change_pct": float, "data_date": str},
-            "GOLD":   {"current": float, "change": float, "change_pct": float, "data_date": str},
-            "DXY":    {"current": float, "change": float, "change_pct": float, "data_date": str},
-            "US10Y":  {"current": float, "change": float, "change_pct": float, "data_date": str},
-            "USDKRW": {"current": float, "change": float, "change_pct": float, "data_date": str},
+            "KOSPI":       {"current", "change", "change_pct", "data_date"},
+            "KOSDAQ":      {"current", "change", "change_pct", "data_date"},
+            "SP500":       {"current", "change", "change_pct", "data_date"},
+            "NASDAQ":      {"current", "change", "change_pct", "data_date"},
+            "DOW":         {"current", "change", "change_pct", "data_date"},
+            "RUSSELL2000": {"current", "change", "change_pct", "data_date"},
+            "GOLD":        {"current", "change", "change_pct", "data_date"},
+            "DXY":         {"current", "change", "change_pct", "data_date"},
+            "US2Y":        {"current", "change", "change_pct", "data_date"},
+            "US10Y":       {"current", "change", "change_pct", "data_date"},
+            "USDKRW":      {"current", "change", "change_pct", "data_date"},
+            "WTI":         {"current", "change", "change_pct", "data_date"},
+            "NATGAS":      {"current", "change", "change_pct", "data_date"},
         }
-        data_date: 실제 데이터 기준일 문자열 (예: "04/25(금)"). 수집 실패 시 해당 항목 제외.
+        수집 실패 항목은 결과에서 제외.
     """
     result = {}
     result.update(_collect_korean_indices())
     result.update(_collect_us_indices())
     result.update(_collect_macro_assets())
+    result.update(_fetch_us2y_from_fred())   # FRED API (API 키 불필요)
     return result
 
 
@@ -95,7 +100,12 @@ def _collect_us_indices() -> dict:
         return {}
 
     result = {}
-    indices = {"SP500": "^GSPC", "NASDAQ": "^IXIC", "DOW": "^DJI"}
+    indices = {
+        "SP500":       "^GSPC",
+        "NASDAQ":      "^IXIC",
+        "DOW":         "^DJI",
+        "RUSSELL2000": "^RUT",
+    }
 
     for name, ticker in indices.items():
         try:
@@ -144,6 +154,8 @@ def _collect_macro_assets() -> dict:
         "DXY":    "DX-Y.NYB",    # 달러인덱스
         "US10Y":  "^TNX",        # 미국 10년물 국채 수익률 (%)
         "USDKRW": "USDKRW=X",    # 원/달러 환율
+        "WTI":    "CL=F",        # WTI 원유 선물
+        "NATGAS": "NG=F",        # 천연가스 선물
     }
 
     result = {}
@@ -170,6 +182,58 @@ def _collect_macro_assets() -> dict:
             logger.warning("%s 수집 실패 (%s): %s", name, ticker, e)
 
     return result
+
+
+def _fetch_us2y_from_fred() -> dict:
+    """FRED에서 미국 2년물 국채 수익률(DGS2)을 수집합니다.
+
+    API 키 없이 FRED 공개 CSV 엔드포인트를 사용합니다.
+    수집 실패 시 빈 dict 반환.
+    """
+    import csv
+    import io
+    import requests
+    from datetime import date as _date
+
+    FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2"
+    try:
+        resp = requests.get(FRED_URL, timeout=10,
+                            headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+
+        reader = csv.reader(io.StringIO(resp.text))
+        # 헤더 행 제외, "." 값(공휴일) 제외, 날짜순 정렬
+        rows = [
+            row for row in reader
+            if len(row) == 2 and row[0] != "DATE" and row[1].strip() not in ("", ".")
+        ]
+        rows.sort(key=lambda r: r[0])  # YYYY-MM-DD 문자열 정렬
+
+        if len(rows) < 2:
+            logger.warning("US2Y(FRED) 데이터 부족: 최소 2행 필요")
+            return {}
+
+        current = float(rows[-1][1])
+        previous = float(rows[-2][1])
+        change = round(current - previous, 4)
+        change_pct = round((change / previous) * 100, 2) if previous != 0 else 0.0
+
+        # 데이터 기준일 파싱 (YYYY-MM-DD → MM/DD(요일))
+        d = _date.fromisoformat(rows[-1][0])
+        data_date = _format_data_date(d)
+
+        logger.info("US2Y 수집 완료 (FRED): %.4f (%.4f%p)", current, change)
+        return {
+            "US2Y": {
+                "current":    round(current, 4),
+                "change":     change,
+                "change_pct": change_pct,
+                "data_date":  data_date,
+            }
+        }
+    except Exception as e:
+        logger.warning("US2Y FRED 수집 실패: %s", e)
+        return {}
 
 
 def _collect_vix() -> dict:

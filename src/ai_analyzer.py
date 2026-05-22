@@ -162,13 +162,22 @@ def build_morning_briefing(
 
     # ── 지수/자산 데이터 텍스트 ──────────────────────────────────────────
     name_map = {
-        "KOSPI": "코스피", "KOSDAQ": "코스닥",
-        "SP500": "S&P500", "NASDAQ": "나스닥", "DOW": "다우존스",
-        "GOLD": "금(달러/온스)", "DXY": "달러인덱스",
-        "US10Y": "미10년물금리(%)", "USDKRW": "원/달러",
+        "KOSPI":       "코스피",
+        "KOSDAQ":      "코스닥",
+        "SP500":       "S&P500",
+        "NASDAQ":      "나스닥100",
+        "DOW":         "다우존스",
+        "RUSSELL2000": "러셀2000",
+        "GOLD":        "금(달러/온스)",
+        "DXY":         "달러인덱스",
+        "US2Y":        "미2년물금리(%)",
+        "US10Y":       "미10년물금리(%)",
+        "USDKRW":      "원/달러",
+        "WTI":         "WTI 원유(달러/배럴)",
+        "NATGAS":      "천연가스(달러/MMBtu)",
     }
-    index_keys = ["SP500", "NASDAQ", "DOW"]
-    macro_keys = ["GOLD", "DXY", "US10Y", "USDKRW"]
+    index_keys = ["SP500", "NASDAQ", "DOW", "RUSSELL2000"]
+    macro_keys = ["GOLD", "DXY", "US2Y", "US10Y", "USDKRW", "WTI", "NATGAS"]
 
     def _fmt(k, v):
         sign = "+" if v["change"] >= 0 else ""
