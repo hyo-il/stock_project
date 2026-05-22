@@ -262,7 +262,7 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
         return "▲" if change >= 0 else "▼"
 
     # ── [미국 증시] ──────────────────────────────────────────────────────
-    lines.append(f"<b>[미국 증시]</b>{date_note}")
+    lines.append(f"📈 <b>[미국 증시]</b>{date_note}")
     us_index_cfg = [
         ("SP500",       "S&amp;P500"),
         ("NASDAQ",      "나스닥100"),
@@ -282,7 +282,7 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
     rate_items = [(k, lbl) for k, lbl in [("US2Y", "2년 수익률"), ("US10Y", "10년 수익률")]
                   if k in stocks]
     if rate_items:
-        lines.append("<b>[미국 국채]</b>")
+        lines.append("🏦 <b>[미국 국채]</b>")
         for key, label in rate_items:
             info = stocks[key]
             prev = _prev(info)
@@ -295,7 +295,7 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
     if "DXY" in stocks:
         info = stocks["DXY"]
         prev = _prev(info)
-        lines.append("<b>[달러 인덱스]</b>")
+        lines.append("💵 <b>[달러 인덱스]</b>")
         lines.append(f"{prev:.3f} → {info['current']:.3f}  {_arrow(info['change'])}")
         lines.append("")
 
@@ -303,7 +303,7 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
     if "GOLD" in stocks:
         info = stocks["GOLD"]
         prev = _prev(info)
-        lines.append("<b>[골드]</b>")
+        lines.append("🥇 <b>[골드]</b>")
         lines.append(f"{prev:,.2f} → {info['current']:,.2f}  {_arrow(info['change'])}")
         lines.append("")
 
@@ -312,7 +312,7 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
                     [("WTI", "WTI", 2), ("NATGAS", "천연가스", 3)]
                     if k in stocks]
     if energy_items:
-        lines.append("<b>[에너지]</b>")
+        lines.append("🛢️ <b>[에너지]</b>")
         for key, label, decimals in energy_items:
             info = stocks[key]
             prev = _prev(info)
@@ -327,7 +327,7 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
         info = stocks["USDKRW"]
         prev = _prev(info)
         sign = "+" if info["change_pct"] >= 0 else ""
-        lines.append("<b>[원/달러]</b>")
+        lines.append("💱 <b>[원/달러]</b>")
         lines.append(
             f"{prev:,.2f} → {info['current']:,.2f}원  "
             f"{_arrow(info['change'])} {sign}{info['change_pct']:.2f}%"
@@ -484,7 +484,7 @@ def format_afternoon_message(stocks: dict, briefing, today_str: str) -> str:
         return "▲" if change >= 0 else "▼"
 
     # ── [국내 지수] ──────────────────────────────────────────────────────
-    lines.append(f"<b>[국내 지수]</b>{date_note}")
+    lines.append(f"📈 <b>[국내 지수]</b>{date_note}")
     for key, label in [("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")]:
         if key in stocks:
             info = stocks[key]
@@ -505,7 +505,7 @@ def format_afternoon_message(stocks: dict, briefing, today_str: str) -> str:
             vix_label = "😟 VIX (주의 구간)"
         else:
             vix_label = "😊 VIX (안정 구간)"
-        lines.append("<b>[공포지수]</b>")
+        lines.append("🌡️ <b>[공포지수]</b>")
         lines.append(
             f"{vix_label}  {prev_vix:.2f} → {vix_val:.2f}  {_arrow(vix_info['change'])}"
         )
