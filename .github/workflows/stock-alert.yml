@@ -2,8 +2,8 @@ name: 주식 정보 자동 알림
 
 on:
   schedule:
-    - cron: '0 22 * * 0-4'   # UTC 일~목 22:00 → KST 월~금 07:00 오전 브리핑
-    - cron: '40 6 * * 1-5'   # UTC 월~금 06:40 → KST 월~금 15:40 오후 브리핑
+    - cron: '30 22 * * 0-4'  # UTC 일~목 22:30 → KST 월~금 07:30 오전 브리핑
+    - cron: '30 7 * * 1-5'   # UTC 월~금 07:30 → KST 월~금 16:30 오후 브리핑
   workflow_dispatch:
     inputs:
       mode:
