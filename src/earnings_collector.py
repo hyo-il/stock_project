@@ -8,6 +8,30 @@ logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 
+
+def _yf_earnings_dates_safe(ticker: str, per_call_timeout: float = 10.0):
+    """yfinance Ticker.earnings_dates 호출에 스레드 타임아웃을 강제합니다.
+
+    수집 실패 시 None 을 반환하여 호출부에서 skip 처리하도록 합니다.
+    """
+    import concurrent.futures
+    import yfinance as yf
+
+    def _call():
+        return yf.Ticker(ticker).earnings_dates
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_call)
+        try:
+            return fut.result(timeout=per_call_timeout)
+        except concurrent.futures.TimeoutError:
+            logger.warning("yfinance %s earnings_dates 타임아웃 (%.1fs)", ticker, per_call_timeout)
+            return None
+        except Exception as e:
+            logger.warning("yfinance %s earnings_dates 예외: %s", ticker, e)
+            return None
+
+
 # 주요 미국 대형주 티커 → 한국어 기업명 매핑
 MAJOR_US_TICKERS = {
     # 빅테크 / AI
@@ -75,10 +99,19 @@ def collect_upcoming_earnings(days_ahead: int = 7) -> list:
         except Exception:
             return ""
 
+    import time as _time
     results = []
+    _loop_start = _time.monotonic()
+    _GLOBAL_TIMEOUT = 90.0  # 전체 18개 티커 처리 상한 (초)
+
     for ticker, name_kr in MAJOR_US_TICKERS.items():
+        # 전체 상한 도달 시 남은 티커 스킵
+        if _time.monotonic() - _loop_start > _GLOBAL_TIMEOUT:
+            logger.warning("earnings 전체 상한 %ss 초과 — 남은 티커 스킵", _GLOBAL_TIMEOUT)
+            break
+
         try:
-            ed = yf.Ticker(ticker).earnings_dates
+            ed = _yf_earnings_dates_safe(ticker, per_call_timeout=10.0)
             if ed is None or ed.empty:
                 continue
 

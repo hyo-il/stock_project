@@ -11,6 +11,29 @@ KST = ZoneInfo("Asia/Seoul")
 _WEEKDAY_KR = ["월", "화", "수", "목", "금", "토", "일"]
 
 
+def _yf_history_safe(ticker: str, period: str = "5d", per_call_timeout: float = 10.0):
+    """yfinance Ticker.history 호출을 별도 스레드로 실행해 타임아웃을 강제합니다.
+
+    yfinance 는 timeout 인자를 공개 API 로 노출하지 않으므로
+    concurrent.futures 로 감싸 per_call_timeout 초 안에 종료되지 않으면
+    예외를 발생시키고 빈 DataFrame 을 반환합니다.
+    """
+    import concurrent.futures
+    import pandas as pd
+    import yfinance as yf
+
+    def _call():
+        return yf.Ticker(ticker).history(period=period)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(_call)
+        try:
+            return fut.result(timeout=per_call_timeout)
+        except concurrent.futures.TimeoutError:
+            logger.warning("yfinance %s history 타임아웃 (%.1fs)", ticker, per_call_timeout)
+            return pd.DataFrame()
+
+
 def _format_data_date(date_obj) -> str:
     """yfinance/FDR index 값에서 'MM/DD(요일)' 문자열을 생성합니다."""
     try:
@@ -109,7 +132,7 @@ def _collect_us_indices() -> dict:
 
     for name, ticker in indices.items():
         try:
-            df = yf.Ticker(ticker).history(period="5d")
+            df = _yf_history_safe(ticker, period="5d")
             if df.empty or len(df) < 2:
                 logger.warning("%s 데이터가 충분하지 않습니다.", name)
                 continue
@@ -161,7 +184,7 @@ def _collect_macro_assets() -> dict:
     result = {}
     for name, ticker in assets_map.items():
         try:
-            df = yf.Ticker(ticker).history(period="5d")
+            df = _yf_history_safe(ticker, period="5d")
             if df.empty or len(df) < 2:
                 logger.warning("%s 데이터가 충분하지 않습니다 (%s).", name, ticker)
                 continue
@@ -250,7 +273,7 @@ def _collect_vix() -> dict:
         return {}
 
     try:
-        df = yf.Ticker("^VIX").history(period="5d")
+        df = _yf_history_safe("^VIX", period="5d")
         if df.empty or len(df) < 2:
             logger.warning("VIX 데이터가 충분하지 않습니다.")
             return {}
