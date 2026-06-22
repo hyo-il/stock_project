@@ -3,10 +3,11 @@
 단일 Gemini 호출로 아래 항목을 JSON으로 생성합니다:
   - 시장 기조 (Risk-On / Risk-Off / 혼조)
   - 포트폴리오 참고 한줄
-  - 핵심 이슈 3선 (스윙 트레이딩 관점 영향 포함)
-  - 오늘의 주도 섹터 (AI 자유 선정, 고정 섹터 없음)
+  - 핵심 테마 3선 (1~3개월 지속 펀더멘털 테마, duration 포함)
+  - 현재 주도 섹터 (AI 자유 선정, 고정 섹터 없음)
   - 스윙 트레이딩 체크포인트
-  - 이번 주 주요 경제 일정
+  - 향후 60일 주요 일정 (this_week/this_month/next_2_months)
+  - 액션 포인트 (패시브 비중 조정 + 스윙 후보)
 """
 
 import json
@@ -123,6 +124,61 @@ def _parse_json_response(raw: str):
     return json.loads(raw)
 
 
+def _filter_upcoming_by_leading_sectors(briefing: dict) -> dict:
+    """upcoming_schedule 의 실적 항목 중 leading_sectors 에 속하지 않는 것을 제거합니다.
+
+    v1.5.10 도입. AI 작성 규칙 "주도섹터만 포함" 의 준수 강제용 사후 필터.
+
+    Rules:
+        - leading_sectors[i].name 과 정확히 일치하는 sector_kr 만 보존
+        - sector_kr 이 빈 문자열인 항목(경제지표·FOMC 등) 은 보존
+        - 그 외 (비주도섹터 실적) 는 제거
+
+    Returns:
+        필터링된 briefing dict (원본 mutate).
+    """
+    if not isinstance(briefing, dict):
+        return briefing
+
+    leading_set = set()
+    for ls in briefing.get('leading_sectors', []) or []:
+        name = (ls.get('name') or '').strip()
+        if name:
+            leading_set.add(name)
+
+    if not leading_set:
+        logger.info("[필터] leading_sectors 비어 있음 — upcoming_schedule 필터 생략")
+        return briefing
+
+    us = briefing.get('upcoming_schedule') or {}
+    if not isinstance(us, dict):
+        return briefing
+
+    removed_total = 0
+    for slot in list(us.keys()):
+        items = us.get(slot, []) or []
+        kept = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            sector = (item.get('sector_kr') or '').strip()
+            if not sector:
+                # 경제지표·FOMC 등 sector_kr 없음 → 보존
+                kept.append(item)
+            elif sector in leading_set:
+                kept.append(item)
+            else:
+                removed_total += 1
+                logger.info("[필터] %s 제거: %s [%s] (주도섹터 외)",
+                            slot, item.get('event', ''), sector)
+        us[slot] = kept
+
+    if removed_total:
+        logger.info("[필터] upcoming_schedule 사후 필터: %d건 제거 (leading=%s)",
+                    removed_total, sorted(leading_set))
+    return briefing
+
+
 # ---------------------------------------------------------------------------
 # 메인 분석 함수
 # ---------------------------------------------------------------------------
@@ -147,10 +203,11 @@ def build_morning_briefing(
             market_regime   : "Risk-On" | "Risk-Off" | "혼조"
             regime_summary  : 기조 요약 1~2문장
             portfolio_note  : 패시브 포트폴리오 한줄 참고
-            key_issues      : [{"icon","category","title","why_important","swing_point"}, ...]  3개
+            key_themes      : [{"icon","category","title","why_important","duration","swing_point"}, ...]  3개
             leading_sectors : [{"emoji","name","stars","reason","stocks_kr","stocks_us"}, ...]  2~3개
             swing_check     : {"phase", "catalysts": [...], "risks": [...]}
-            weekly_schedule : [{"date","event","detail","importance"}, ...]  3~5개
+            upcoming_schedule : {"this_week":[...], "this_month":[...], "next_2_months":[...]}  (각 항목 date/event/ticker/sector_kr/detail/importance)
+            portfolio_adjustment : {"passive_note": str, "swing_candidates": [...]}
         실패 시 None 반환.
     """
     if today_str is None:
@@ -190,11 +247,20 @@ def build_morning_briefing(
 
     # ── 실적 발표 텍스트 ─────────────────────────────────────────────────
     if earnings:
-        earnings_lines = [
-            f"  {e['name_kr']}({e['ticker']}) — {e['earnings_date']}"
-            f"{' EPS추정 ' + e['eps_estimate'] if e['eps_estimate'] != '-' else ''}"
-            for e in earnings
-        ]
+        # v1.5.7: 직전분기 실제·분산·sanity flag·매출(노이즈 시 숨김) 반영
+        earnings_lines = []
+        for e in earnings:
+            flag = " ⚠️" if e.get("eps_sanity_flag") else ""
+            disp = e.get("eps_dispersion", "-")
+            disp_part = f", {disp}" if disp and disp != "-" else ""
+            rev = e.get("revenue_estimate", "-")
+            rev_part = f" / 매출 {rev}" if rev and rev != "-" else ""
+            earnings_lines.append(
+                f"- {e['earnings_date']} [{e['sector_kr']}] {e['name_kr']}({e['ticker']})\n"
+                f"    예상 EPS {e['eps_estimate']}{flag} (직전분기 실제 {e['last_quarter_eps_actual']}"
+                f", 전년동기 실제 {e['yoy_eps_actual']}{disp_part}){rev_part}"
+                f" / 컨센서스 {e['recommendation']}"
+            )
         earnings_text = "\n".join(earnings_lines)
     else:
         earnings_text = "(실적 발표 예정 없음 또는 수집 실패)"
@@ -226,7 +292,7 @@ def build_morning_briefing(
 [매크로 자산 (전일 종가)]
 {macro_text or "  (데이터 없음)"}
 
-[이번 주 주요 기업 실적 발표 (yfinance 실제 데이터)]
+[향후 60일 주요 기업 실적 발표 예정 (yfinance 실제 데이터, 75개 대형주 풀에서 수집)]
 {earnings_text}
 
 [오늘 국내 뉴스]
@@ -241,13 +307,14 @@ def build_morning_briefing(
   "market_regime": "Risk-On 또는 Risk-Off 또는 혼조",
   "regime_summary": "오늘 시장 기조를 1~2문장으로 요약",
   "portfolio_note": "패시브 포트폴리오 4개 자산 중 오늘 특이 동향 한줄 (예: 금 ETF 강세 유지 / 채권 관망)",
-  "key_issues": [
+  "key_themes": [
     {{
       "icon": "🔴 또는 🟡 또는 🟢 (🔴=하락 리스크, 🟡=중립/혼조, 🟢=상승 모멘텀)",
-      "category": "분류 (예: 실적, 지정학, 통화정책, 무역, 경제지표, 에너지, 기술)",
-      "title": "이슈 제목 (한국어, 간결하게)",
+      "category": "테마 분류 (예: 실적사이클, 통화정책, 정책·규제, 지정학, 산업구조 변화)",
+      "title": "테마 제목 (1~3개월 지속 가능한 펀더멘털 테마)",
       "why_important": "왜 중요한지 — 투자 초보자도 이해할 수 있는 1문장",
-      "swing_point": "스윙 트레이딩 관점 포인트 — 어떤 섹터/종목에 어떤 영향인지 구체적으로"
+      "duration": "예상 지속 기간 (예: '1~2개월', '분기 전반', '연말까지')",
+      "swing_point": "스윙 관점 — 어떤 섹터/종목에 어떤 영향인지 구체적으로"
     }}
   ],
   "leading_sectors": [
@@ -265,37 +332,87 @@ def build_morning_briefing(
     "catalysts": ["향후 1~2주 내 주요 촉매제 (날짜 포함)", "..."],
     "risks": ["주요 하방 리스크", "..."]
   }},
-  "weekly_schedule": [
-    {{
-      "date": "MM/DD(요일)",
-      "event": "경제지표·실적·정책회의 등 일정명",
-      "detail": "기업명+예상EPS/이전값 등 구체 정보 (없으면 빈 문자열)",
-      "importance": 1
-    }}
-  ]
+  "upcoming_schedule": {{
+    "this_week": [
+      {{
+        "date": "MM/DD(요일)",
+        "event": "이벤트명",
+        "ticker": "티커 (실적 발표인 경우, 아니면 빈 문자열)",
+        "sector_kr": "섹터명 (실적 발표인 경우, 아니면 빈 문자열)",
+        "detail": "예상 EPS·매출·YoY·컨센서스 등 한 줄 요약",
+        "importance": 3
+      }}
+    ],
+    "this_month": [
+      {{ "date":"...","event":"...","ticker":"...","sector_kr":"...","detail":"...","importance": 2 }}
+    ],
+    "next_2_months": [
+      {{ "date":"...","event":"...","ticker":"...","sector_kr":"...","detail":"...","importance": 1 }}
+    ]
+  }},
+  "portfolio_adjustment": {{
+    "passive_note": "패시브 4자산(S&P500 ETF / 미국배당다우존스 / 국고채10년 / 금) 비중 미세 조정 제안 한 줄. 예: '금 ETF +2%p 검토, 국고채 -2%p (변동성 상승 대응)'. 조정 불필요 시 '현 비중 유지 권장' + 1문장 근거.",
+    "swing_candidates": [
+      "스윙 진입 후보 1: '<종목명>(<티커>) — <진입 근거 1문장>, 진입 가격 또는 조건 1문장'",
+      "스윙 진입 후보 2 (또는 빈 문자열로 0~2개 허용)"
+    ]
+  }}
 }}
 
 [작성 규칙]
-- 데이터 기준일 인식: 위 [주요 지수]·[매크로 자산]에 표시된 [MM/DD(요일) 종가] 라벨을 반드시 인식하고,
-  현재 시점(브리핑 작성 시각)이 해당 종가 이후임을 전제로 어조를 조정하세요.
-  예: "강세를 보이고 있습니다" → "금요일 강세 마감", "오르는 중입니다" → "전 거래일 상승 마감".
-  미국 지수가 금요일 종가라면 "주말 휴장 후 월요일 개장 주목" 식으로 표현 가능.
-- key_issues: 정확히 3개, 시장 영향력 큰 순서로 배열.
-  ★ 실적 발표 뉴스(개별 기업 어닝/가이던스)는 최우선으로 1번 또는 2번 슬롯에 배치.
-  why_important는 초보자도 이해할 수 있게 평이한 표현 사용.
-  금융 전문용어가 불가피하면 괄호로 짧게 풀이 병기 (예: "FOMC(미 연준 통화정책 회의)", "EPS(주당순이익)").
-  swing_point는 "어떤 섹터의 어떤 종목군이 수혜/타격"인지 구체적으로 명시.
-- leading_sectors: 2~3개, 오늘 뉴스에서 실제 움직임이 확인되는 섹터만 선정 (고정 섹터 없음).
-  ★ 1~2주 단기 이벤트(행사, 컨퍼런스, 단기 테마)나 계절성 요인만으로 섹터를 선정하지 말 것.
-  ★ 실적(어닝), 정책 변화, 금리·환율 등 최소 3개월 이상 지속 가능한 펀더멘털 근거가 있는 섹터만 선정.
-- weekly_schedule: 오늘 이후 이번 주 남은 날짜 기준 3~5개, importance는 1(일반)·2(중요)·3(매우중요).
-  ★ [이번 주 주요 기업 실적 발표] 섹션에 제공된 실제 데이터를 최우선으로 반영할 것.
-    반드시 해당 기업명·날짜·EPS 추정치를 그대로 사용하고 importance=3으로 설정.
-  ★ 공휴일, 시장 개장/휴장 안내, 연준 위원 연설 일정 등 투자 판단에 직접 영향이 없는 항목은 제외.
-  ★ 포함 대상: 주요 경제지표(CPI, PCE, 고용보고서, GDP 등), 연준 FOMC 회의, 주요 기업 실적 발표.
-  실적 발표 일정은 detail에 "EPS추정 $X.XX" 형식으로 포함. 알 수 없으면 빈 문자열.
-  지표 발표는 detail에 "예상치 X.X% vs 이전 Y.Y%" 식 포함. 알 수 없으면 빈 문자열.
-- 투자 권유 표현 절대 금지 ("매수하세요", "추천합니다" 등).
+- 데이터 기준일 인식: [주요 지수]·[매크로 자산]의 [MM/DD(요일) 종가] 라벨을 인식하고
+  현재 시점이 해당 종가 이후임을 전제로 어조 조정.
+- key_themes: 정확히 3개, 1~3개월 지속 가능한 펀더멘털 테마만 선정.
+  ★ 당일 단발성 뉴스, 1~2주 단기 이벤트, 단순 헤드라인, 소문 제외.
+  ★ 포함 대상: 실적 사이클 흐름, 통화정책 방향(연준 금리경로), 정책·규제, 지정학, 산업구조 변화(AI·전기차 등 메가트렌드).
+  duration 은 반드시 명시. swing_point 는 어떤 섹터·종목에 어떤 영향인지 구체.
+- leading_sectors: 2~3개. 1~2주 단기 이벤트 / 계절성 테마 선정 금지.
+  ★ 3개월 이상 지속 가능한 펀더멘털 근거가 있는 섹터만.
+  reason 은 "오늘 뉴스" 가 아니라 "현재~향후 3개월 지속 근거" 로 작성.
+  ★ name 은 다음 EXTENDED_TICKERS sector_kr 명칭 중에서 **정확히 일치**하게 선택 (v1.5.10):
+    "빅테크/AI", "반도체", "소프트웨어", "자동차/EV", "소비재(리테일)", "음식료/생활",
+    "금융", "헬스케어/제약", "산업/항공/방산", "미디어/통신", "에너지", "유틸리티/리츠"
+  ★ "반도체 산업", "AI/빅테크" 같이 변형하지 말 것. Python 측 사후 필터가 정확 매칭만 함.
+  ★ 위 명칭에 해당하지 않는 새 섹터를 선정할 경우, upcoming_schedule 의 해당 섹터 항목이 사후 필터로 모두 제거됨.
+- upcoming_schedule: 향후 60일 주요 일정을 다음 3개 슬롯으로 분류.
+  · this_week: 0~7일, importance=3, 최대 6개
+  · this_month: 8~30일, importance=2, 최대 5개
+  · next_2_months: 31~60일, importance=1, 최대 5개
+  ★ leading_sectors 의 sector_kr 과 일치하는 실적만 포함. 그 외 섹터 실적은 생략.
+  ★ 슬롯 한도 초과 시 임박 날짜 우선.
+  ★ 실적 발표 항목의 event 필드는 반드시 "<회사명> 실적 발표" 형식으로 작성 (예: "마이크론 실적 발표", "JP모건 실적 발표").
+    회사명은 [향후 60일 주요 기업 실적 발표 예정] 섹션의 name_kr 필드 값을 그대로 사용.
+    단순히 "실적 발표" 만 적으면 회사명이 누락되어 가독성이 떨어짐.
+  ★ 실적 detail 형식 (압축형, v1.5.8): 다음 형식을 반드시 따를 것.
+    "예상 EPS $<X.XX>[⚠️] (직전 $<Q>, YoY $<Y>[, ±<N>%]) | 컨센서스 <Buy/Hold/Sell>(<n>/<m>) [| 매출 $<R>B]"
+    - 직전분기 EPS 는 "직전 $X.XX" 로 짧게 (직전분기 실제 → 직전).
+    - 전년동기 EPS 는 "YoY $X.XX" 로 짧게 (전년동기 실제 → YoY).
+    - 분산은 30% 이상일 때만 ", ±N%" 추가, 30% 미만이면 생략.
+    - 컨센서스 사이 공백 제거: "Buy(39/44)" (구버전 "Buy (39/44)" 보다 1자 절감).
+    - 매출은 "-" 가 아닐 때만 " | 매출 $X.XB" 형식으로 끝에 추가, "-" 이면 통째로 생략.
+    - 구분자는 슬래시 "/" 가 아닌 파이프 "|" 사용 (가독성).
+    예 (정상): "예상 EPS $5.41 (직전 $5.94, YoY $4.96) | 컨센서스 Buy(12/24) | 매출 $48.72B"
+    예 (sanity flag): "예상 EPS $0.12 ⚠️ (직전 $0.35, YoY $0.14, ±50%) | 컨센서스 Hold(21/38) | 매출 $11.51B"
+    예 (매출 차단): "예상 EPS $20.05 (직전 $12.20, YoY $1.91, ±46%) | 컨센서스 Buy(39/44)"
+  ★ ⚠️ 마크가 붙은 항목(eps_sanity_flag) 끝에 ", 신뢰도 주의" 한 어절을 detail 마지막에 추가.
+    예: "예상 EPS $0.12 ⚠️ (직전 $0.35, YoY $0.14, ±50%) | 컨센서스 Hold(21/38) | 매출 $11.51B, 신뢰도 주의"
+  ★ 매출이 "-" 인 경우 매출 항목 생략.
+  ★ 경제지표·FOMC 포함 가능, 공휴일·단순 연설 제외.
+  ★ ticker / sector_kr 은 실적인 경우에만 채움.
+- swing_check.catalysts (v1.5.8 강화):
+  ★ catalysts 는 upcoming_schedule (②) 와 절대 중복 금지. 같은 실적 발표 일정을 반복 노출하지 말 것.
+  ★ 포함 대상: FOMC 회의, CPI/PCE/고용지표 등 경제지표 발표일, 정책 이벤트, 지정학·규제 이벤트만.
+  ★ 실적 발표 일정은 ② 에 이미 표시되므로 catalysts 에서 제외.
+  ★ 최대 3개. 해당 없으면 빈 리스트 []. 억지로 채우지 말 것.
+- portfolio_adjustment (v1.5.8 길이 한도 강화):
+  ★ passive_note 는 1문장, 80자 이내 (한국어 기준). 4자산 중 어떤 자산 ±%p 조정 또는 "현 비중 유지" 명확히.
+    예 (80자 이내): "금 ETF +2%p 검토, 국고채 -2%p (변동성 상승 대응)."
+    예 (현 비중 유지): "현 비중 유지 권장 — 매크로 큰 변화 없음, 분기 리밸런싱 대기."
+  ★ swing_candidates 각 항목 100자 이내, 0~2개. 형식:
+    "<종목명>(<티커>) — <진입 근거 1문장>, <진입 시점/조건>"
+    예 (100자 이내): "마이크론(MU) — AI 메모리 수요 강세, 06/24 실적 발표 후 가이던스 확인 후 진입 검토."
+  ★ ⚠️ sanity flag 된 종목(eps_sanity_flag=True)은 swing_candidates 추천 제외 또는 "추정 신뢰도 낮음" 명시.
+  ★ 투자 권유 표현 금지 ("매수하세요" 등). 권유성은 "진입 후보로 검토 가능" 형태로.
 - 인사말·서문·결론 문구 금지."""
 
     # ── Gemini 호출 (최대 2회 시도) ─────────────────────────────────────
@@ -312,13 +429,15 @@ def build_morning_briefing(
             result = _parse_json_response(response.text)
 
             # 필수 키 검증
-            required = ["market_regime", "key_issues", "leading_sectors", "swing_check", "weekly_schedule"]
+            required = ["market_regime", "key_themes", "leading_sectors", "swing_check", "upcoming_schedule", "portfolio_adjustment"]
             missing = [k for k in required if k not in result]
             if missing:
                 logger.warning("[시도 %d] 누락된 키: %s. 재시도합니다.", attempt + 1, missing)
                 continue
 
             logger.info("오전 브리핑 AI 분석 완료 (%d자)", len(response.text))
+            # v1.5.10: 주도섹터 사후 필터 강제
+            result = _filter_upcoming_by_leading_sectors(result)
             return result
 
         except Exception as e:
@@ -352,10 +471,11 @@ def build_afternoon_briefing(
             market_summary   : 오늘 국내 시장 총평 (1~2문장)
             vix_comment      : VIX 수준 해설 (1문장)
             portfolio_note   : 패시브 포트폴리오 한줄 참고
-            key_issues       : [{"icon","category","title","why_important","swing_point"}, ...]  3개
+            key_themes       : [{"icon","category","title","why_important","duration","swing_point"}, ...]  3개
             leading_sectors  : [{"emoji","name","stars","reason","stocks_kr","stocks_us"}, ...]  2~3개
             swing_check      : {"phase", "catalysts": [...], "risks": [...]}
-            weekly_schedule  : [{"date","event","detail","importance"}, ...]  3~5개
+            upcoming_schedule : {"this_week":[...], "this_month":[...], "next_2_months":[...]}  (각 항목 date/event/ticker/sector_kr/detail/importance)
+            portfolio_adjustment : {"passive_note": str, "swing_candidates": [...]}
         실패 시 None 반환.
     """
     if today_str is None:
@@ -392,11 +512,20 @@ def build_afternoon_briefing(
 
     # ── 실적 텍스트 ─────────────────────────────────────────────────────
     if earnings:
-        earnings_lines = [
-            f"  {e['name_kr']}({e['ticker']}) — {e['earnings_date']}"
-            f"{' EPS추정 ' + e['eps_estimate'] if e['eps_estimate'] != '-' else ''}"
-            for e in earnings
-        ]
+        # v1.5.7: 직전분기 실제·분산·sanity flag·매출(노이즈 시 숨김) 반영
+        earnings_lines = []
+        for e in earnings:
+            flag = " ⚠️" if e.get("eps_sanity_flag") else ""
+            disp = e.get("eps_dispersion", "-")
+            disp_part = f", {disp}" if disp and disp != "-" else ""
+            rev = e.get("revenue_estimate", "-")
+            rev_part = f" / 매출 {rev}" if rev and rev != "-" else ""
+            earnings_lines.append(
+                f"- {e['earnings_date']} [{e['sector_kr']}] {e['name_kr']}({e['ticker']})\n"
+                f"    예상 EPS {e['eps_estimate']}{flag} (직전분기 실제 {e['last_quarter_eps_actual']}"
+                f", 전년동기 실제 {e['yoy_eps_actual']}{disp_part}){rev_part}"
+                f" / 컨센서스 {e['recommendation']}"
+            )
         earnings_text = "\n".join(earnings_lines)
     else:
         earnings_text = "(실적 발표 예정 없음 또는 수집 실패)"
@@ -423,7 +552,7 @@ def build_afternoon_briefing(
 [시장 공포 지수]
 {vix_level or "  (데이터 없음)"}
 
-[이번 주 주요 기업 실적 발표 (yfinance 실제 데이터)]
+[향후 60일 주요 기업 실적 발표 예정 (yfinance 실제 데이터, 75개 대형주 풀에서 수집)]
 {earnings_text}
 
 [오늘 국내 뉴스]
@@ -435,13 +564,14 @@ def build_afternoon_briefing(
   "market_summary": "오늘 국내 시장(코스피·코스닥) 마감 총평 1~2문장",
   "vix_comment": "현재 VIX 수준이 스윙 트레이딩에 갖는 의미 1문장",
   "portfolio_note": "패시브 포트폴리오 4개 자산 중 오늘 주목할 동향 한줄",
-  "key_issues": [
+  "key_themes": [
     {{
-      "icon": "🔴 또는 🟡 또는 🟢",
-      "category": "분류 (예: 실적, 지정학, 통화정책, 무역, 경제지표, 에너지, 기술)",
-      "title": "이슈 제목 (한국어, 간결하게)",
+      "icon": "🔴 또는 🟡 또는 🟢 (🔴=하락 리스크, 🟡=중립/혼조, 🟢=상승 모멘텀)",
+      "category": "테마 분류 (예: 실적사이클, 통화정책, 정책·규제, 지정학, 산업구조 변화)",
+      "title": "테마 제목 (1~3개월 지속 가능한 펀더멘털 테마)",
       "why_important": "왜 중요한지 — 투자 초보자도 이해할 수 있는 1문장. 전문용어는 괄호로 풀이 병기",
-      "swing_point": "스윙 트레이딩 관점 — 어떤 섹터/종목군에 어떤 영향인지 구체적으로"
+      "duration": "예상 지속 기간 (예: '1~2개월', '분기 전반', '연말까지')",
+      "swing_point": "스윙 관점 — 어떤 섹터/종목에 어떤 영향인지 구체적으로"
     }}
   ],
   "leading_sectors": [
@@ -459,31 +589,88 @@ def build_afternoon_briefing(
     "catalysts": ["향후 1~2주 내 주요 촉매제 (날짜 포함)", "..."],
     "risks": ["주요 하방 리스크", "..."]
   }},
-  "weekly_schedule": [
-    {{
-      "date": "MM/DD(요일)",
-      "event": "경제지표·실적·정책회의 등 일정명",
-      "detail": "구체 정보 (없으면 빈 문자열)",
-      "importance": 1
-    }}
-  ]
+  "upcoming_schedule": {{
+    "this_week": [
+      {{
+        "date": "MM/DD(요일)",
+        "event": "이벤트명",
+        "ticker": "티커 (실적 발표인 경우, 아니면 빈 문자열)",
+        "sector_kr": "섹터명 (실적 발표인 경우, 아니면 빈 문자열)",
+        "detail": "예상 EPS·매출·YoY·컨센서스 등 한 줄 요약",
+        "importance": 3
+      }}
+    ],
+    "this_month": [
+      {{ "date":"...","event":"...","ticker":"...","sector_kr":"...","detail":"...","importance": 2 }}
+    ],
+    "next_2_months": [
+      {{ "date":"...","event":"...","ticker":"...","sector_kr":"...","detail":"...","importance": 1 }}
+    ]
+  }},
+  "portfolio_adjustment": {{
+    "passive_note": "패시브 4자산(S&P500 ETF / 미국배당다우존스 / 국고채10년 / 금) 비중 미세 조정 제안 한 줄. 예: '금 ETF +2%p 검토, 국고채 -2%p (변동성 상승 대응)'. 조정 불필요 시 '현 비중 유지 권장' + 1문장 근거.",
+    "swing_candidates": [
+      "스윙 진입 후보 1: '<종목명>(<티커>) — <진입 근거 1문장>, 진입 가격 또는 조건 1문장'",
+      "스윙 진입 후보 2 (또는 빈 문자열로 0~2개 허용)"
+    ]
+  }}
 }}
 
 [작성 규칙]
 - market_summary: 오늘 코스피·코스닥 등락과 주요 원인을 과거형으로 서술.
 - vix_comment: VIX 수치({vix_info.get('current', 'N/A')})를 언급하며 안정/주의/공포 여부와 스윙 트레이딩 시사점 서술.
-- key_issues: 정확히 3개. 실적 발표 뉴스는 최우선 1번 슬롯.
-  why_important는 초보자도 이해할 수 있게 평이한 표현 사용.
+- key_themes: 정확히 3개, 1~3개월 지속 가능한 펀더멘털 테마만 선정.
+  ★ 당일 단발성 뉴스, 1~2주 단기 이벤트, 단순 헤드라인, 소문 제외.
+  ★ 포함 대상: 실적 사이클 흐름, 통화정책 방향(연준 금리경로), 정책·규제, 지정학, 산업구조 변화(AI·전기차 등 메가트렌드).
+  duration 은 반드시 명시. swing_point 는 어떤 섹터·종목에 어떤 영향인지 구체.
   금융 전문용어 사용 시 괄호로 짧게 풀이 병기 (예: "FOMC(미 연준 통화정책 회의)", "EPS(주당순이익)").
-  ROE는 자기자본이익률, EPS는 주당순이익으로 정확히 사용.
-- leading_sectors: 2~3개. 1~2주 단기 이벤트나 테마 섹터 선정 금지.
-  최소 3개월 이상 지속 가능한 실적·정책·펀더멘털 근거가 있는 섹터만 선정.
-- weekly_schedule: 오늘 이후 이번 주 남은 날짜 기준 3~5개.
-  ★ [이번 주 주요 기업 실적 발표] 섹션의 실제 데이터를 최우선 반영. importance=3 설정.
-  ★ 공휴일, 시장 개장/휴장 안내, 연준 위원 단순 연설은 제외.
-  ★ 포함 대상: 주요 경제지표, FOMC 회의, 주요 기업 실적 발표.
-  실적 발표는 detail에 "EPS추정 $X.XX" 포함. 경제지표는 "예상치 X.X% vs 이전 Y.Y%".
-- 투자 권유 표현 절대 금지.
+- leading_sectors: 2~3개. 1~2주 단기 이벤트 / 계절성 테마 선정 금지.
+  ★ 3개월 이상 지속 가능한 펀더멘털 근거가 있는 섹터만.
+  reason 은 "오늘 뉴스" 가 아니라 "현재~향후 3개월 지속 근거" 로 작성.
+  ★ name 은 다음 EXTENDED_TICKERS sector_kr 명칭 중에서 **정확히 일치**하게 선택 (v1.5.10):
+    "빅테크/AI", "반도체", "소프트웨어", "자동차/EV", "소비재(리테일)", "음식료/생활",
+    "금융", "헬스케어/제약", "산업/항공/방산", "미디어/통신", "에너지", "유틸리티/리츠"
+  ★ "반도체 산업", "AI/빅테크" 같이 변형하지 말 것. Python 측 사후 필터가 정확 매칭만 함.
+  ★ 위 명칭에 해당하지 않는 새 섹터를 선정할 경우, upcoming_schedule 의 해당 섹터 항목이 사후 필터로 모두 제거됨.
+- upcoming_schedule: 향후 60일 주요 일정을 다음 3개 슬롯으로 분류.
+  · this_week: 0~7일, importance=3, 최대 6개
+  · this_month: 8~30일, importance=2, 최대 5개
+  · next_2_months: 31~60일, importance=1, 최대 5개
+  ★ leading_sectors 의 sector_kr 과 일치하는 실적만 포함. 그 외 섹터 실적은 생략.
+  ★ 슬롯 한도 초과 시 임박 날짜 우선.
+  ★ 실적 발표 항목의 event 필드는 반드시 "<회사명> 실적 발표" 형식으로 작성 (예: "마이크론 실적 발표", "JP모건 실적 발표").
+    회사명은 [향후 60일 주요 기업 실적 발표 예정] 섹션의 name_kr 필드 값을 그대로 사용.
+    단순히 "실적 발표" 만 적으면 회사명이 누락되어 가독성이 떨어짐.
+  ★ 실적 detail 형식 (압축형, v1.5.8): 다음 형식을 반드시 따를 것.
+    "예상 EPS $<X.XX>[⚠️] (직전 $<Q>, YoY $<Y>[, ±<N>%]) | 컨센서스 <Buy/Hold/Sell>(<n>/<m>) [| 매출 $<R>B]"
+    - 직전분기 EPS 는 "직전 $X.XX" 로 짧게 (직전분기 실제 → 직전).
+    - 전년동기 EPS 는 "YoY $X.XX" 로 짧게 (전년동기 실제 → YoY).
+    - 분산은 30% 이상일 때만 ", ±N%" 추가, 30% 미만이면 생략.
+    - 컨센서스 사이 공백 제거: "Buy(39/44)" (구버전 "Buy (39/44)" 보다 1자 절감).
+    - 매출은 "-" 가 아닐 때만 " | 매출 $X.XB" 형식으로 끝에 추가, "-" 이면 통째로 생략.
+    - 구분자는 슬래시 "/" 가 아닌 파이프 "|" 사용 (가독성).
+    예 (정상): "예상 EPS $5.41 (직전 $5.94, YoY $4.96) | 컨센서스 Buy(12/24) | 매출 $48.72B"
+    예 (sanity flag): "예상 EPS $0.12 ⚠️ (직전 $0.35, YoY $0.14, ±50%) | 컨센서스 Hold(21/38) | 매출 $11.51B"
+    예 (매출 차단): "예상 EPS $20.05 (직전 $12.20, YoY $1.91, ±46%) | 컨센서스 Buy(39/44)"
+  ★ ⚠️ 마크가 붙은 항목(eps_sanity_flag) 끝에 ", 신뢰도 주의" 한 어절을 detail 마지막에 추가.
+    예: "예상 EPS $0.12 ⚠️ (직전 $0.35, YoY $0.14, ±50%) | 컨센서스 Hold(21/38) | 매출 $11.51B, 신뢰도 주의"
+  ★ 매출이 "-" 인 경우 매출 항목 생략.
+  ★ 경제지표·FOMC 포함 가능, 공휴일·단순 연설 제외.
+  ★ ticker / sector_kr 은 실적인 경우에만 채움.
+- swing_check.catalysts (v1.5.8 강화):
+  ★ catalysts 는 upcoming_schedule (②) 와 절대 중복 금지. 같은 실적 발표 일정을 반복 노출하지 말 것.
+  ★ 포함 대상: FOMC 회의, CPI/PCE/고용지표 등 경제지표 발표일, 정책 이벤트, 지정학·규제 이벤트만.
+  ★ 실적 발표 일정은 ② 에 이미 표시되므로 catalysts 에서 제외.
+  ★ 최대 3개. 해당 없으면 빈 리스트 []. 억지로 채우지 말 것.
+- portfolio_adjustment (v1.5.8 길이 한도 강화):
+  ★ passive_note 는 1문장, 80자 이내 (한국어 기준). 4자산 중 어떤 자산 ±%p 조정 또는 "현 비중 유지" 명확히.
+    예 (80자 이내): "금 ETF +2%p 검토, 국고채 -2%p (변동성 상승 대응)."
+    예 (현 비중 유지): "현 비중 유지 권장 — 매크로 큰 변화 없음, 분기 리밸런싱 대기."
+  ★ swing_candidates 각 항목 100자 이내, 0~2개. 형식:
+    "<종목명>(<티커>) — <진입 근거 1문장>, <진입 시점/조건>"
+    예 (100자 이내): "마이크론(MU) — AI 메모리 수요 강세, 06/24 실적 발표 후 가이던스 확인 후 진입 검토."
+  ★ ⚠️ sanity flag 된 종목(eps_sanity_flag=True)은 swing_candidates 추천 제외 또는 "추정 신뢰도 낮음" 명시.
+  ★ 투자 권유 표현 금지 ("매수하세요" 등). 권유성은 "진입 후보로 검토 가능" 형태로.
 - 인사말·서문·결론 문구 금지."""
 
     # ── Gemini 호출 (최대 2회 시도) ─────────────────────────────────────
@@ -499,13 +686,15 @@ def build_afternoon_briefing(
             last_response_text = response.text
             result = _parse_json_response(response.text)
 
-            required = ["market_summary", "key_issues", "leading_sectors", "swing_check", "weekly_schedule"]
+            required = ["market_summary", "key_themes", "leading_sectors", "swing_check", "upcoming_schedule", "portfolio_adjustment"]
             missing = [k for k in required if k not in result]
             if missing:
                 logger.warning("[시도 %d] 누락된 키: %s. 재시도합니다.", attempt + 1, missing)
                 continue
 
             logger.info("오후 브리핑 AI 분석 완료 (%d자)", len(response.text))
+            # v1.5.10: 주도섹터 사후 필터 강제
+            result = _filter_upcoming_by_leading_sectors(result)
             return result
 
         except Exception as e:

@@ -1,9 +1,12 @@
 name: 주식 정보 자동 알림
 
 on:
-  # v1.5.5: 수동 트리거 전용
-  # schedule 트리거의 GitHub Actions 큐 지연(최대 5h 관측)으로 제거됨
-  # 사용자가 GitHub Mobile 앱 또는 웹에서 "Run workflow" 로 실행
+  # v1.5.6: 사용자 결정으로 schedule 자동 트리거 부활 (수동 workflow_dispatch 병행)
+  # ⚠️ trade-off: GitHub Actions schedule 큐 지연(최대 ~5h 관측) 가능성 잔존.
+  #    정시 도착이 필요하면 "Run workflow" 수동 트리거 사용.
+  schedule:
+    - cron: '30 22 * * 0-4'  # UTC 일~목 22:30 → KST 월~금 07:30 오전 브리핑
+    - cron: '30 7 * * 1-5'   # UTC 월~금 07:30 → KST 월~금 16:30 오후 브리핑
   workflow_dispatch:
     inputs:
       mode:
@@ -22,7 +25,7 @@ concurrency:
 jobs:
   send-stock-alert:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -35,11 +38,11 @@ jobs:
 
       - name: 실행 모드 결정
         run: |
-          # v1.5.5: workflow_dispatch 전용. else 폴백은 미래 트리거 추가 대비.
+          # v1.5.6: workflow_dispatch 는 입력 mode 사용. schedule 등은 KST 13시 폴백.
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "RUN_MODE=${{ github.event.inputs.mode }}" >> $GITHUB_ENV
           else
-            # 폴백: KST 13시 경계 (iPhone Shortcuts 등 외부 트리거 미래 추가 대비)
+            # 폴백: KST 13시 경계 (schedule cron 및 외부 트리거 — 07:30→morning, 16:30→afternoon)
             HOUR=$(TZ=Asia/Seoul date +%H)
             if [ "$HOUR" -lt 13 ]; then
               echo "RUN_MODE=morning"   >> $GITHUB_ENV

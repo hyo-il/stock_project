@@ -100,7 +100,7 @@ def _run_morning(today_str: str) -> None:
     earnings = []
     try:
         logger.info("3단계: 주요 기업 실적 발표 수집 중...")
-        earnings = collect_upcoming_earnings(days_ahead=7)
+        earnings = collect_upcoming_earnings(days_ahead=60)
         logger.info("실적 발표 수집 완료: %d건", len(earnings))
     except Exception as e:
         logger.error("실적 발표 수집 중 예외 발생: %s", e)
@@ -166,7 +166,7 @@ def _run_afternoon(today_str: str) -> None:
     earnings = []
     try:
         logger.info("3단계: 주요 기업 실적 발표 수집 중...")
-        earnings = collect_upcoming_earnings(days_ahead=7)
+        earnings = collect_upcoming_earnings(days_ahead=60)
         logger.info("실적 발표 수집 완료: %d건", len(earnings))
     except Exception as e:
         logger.error("실적 발표 수집 중 예외 발생: %s", e)
@@ -208,20 +208,16 @@ def _run_afternoon(today_str: str) -> None:
 def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
     """오전 브리핑 텔레그램 HTML 메시지를 포맷팅합니다 (오선 스타일).
 
-    구조:
+    구조 (v1.5.7: 방향성 중심 재배치):
         헤더
         ① 시장 기조 + 포트폴리오 참고 한줄
-        ② 시장 데이터 (오선 스타일 카테고리 분류)
-           [미국 증시] S&P500 / 나스닥100 / 다우 / 러셀2000
-           [미국 국채] 2년 수익률 / 10년 수익률
-           [달러 인덱스]
-           [골드]
-           [에너지] WTI / 천연가스
-           [원/달러]
-        ③ 핵심 이슈 3선
-        ④ 오늘의 주도 섹터
-        ⑤ 스윙 트레이딩 체크포인트
-        ⑥ 이번 주 주요 일정
+        ② 향후 60일 주요 일정 (승격, 메시지 중심)
+        ③ 현재 주도 섹터
+        ④ 핵심 테마 (1~3개월, duration 명시)
+        ⑤ 시장 데이터 (참고)
+           [미국 증시] / [미국 국채] / [달러 인덱스] / [골드] / [에너지] / [원/달러]
+        ⑥ 스윙 트레이딩 체크포인트
+        ⑦ 액션 포인트 (패시브 비중 조정 + 스윙 후보)
         면책 문구
     """
     now_kst = datetime.now(KST)
@@ -248,125 +244,133 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
     lines.append("")
 
     # ─────────────────────────────────────────────────────────────────────
-    # ② 시장 데이터 (오선 스타일)
+    # 시장 데이터 블록 (v1.5.7: ⑤ 위치, 참고용) — 함수로 분리해 재사용
     # ─────────────────────────────────────────────────────────────────────
-    us_data_date = stocks.get("SP500", {}).get("data_date", "")
-    date_note = f"  <i>※ {us_data_date} 종가 기준</i>" if us_data_date else ""
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    def _emit_market_data():
+        us_data_date = stocks.get("SP500", {}).get("data_date", "")
+        date_note = f"  <i>※ {us_data_date} 종가 기준</i>" if us_data_date else ""
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
 
-    def _prev(info: dict) -> float:
-        """이전 값 = 현재값 - 변동폭"""
-        return info["current"] - info["change"]
+        def _prev(info: dict) -> float:
+            return info["current"] - info["change"]
 
-    def _arrow(change: float) -> str:
-        return "▲" if change >= 0 else "▼"
+        def _arrow(change: float) -> str:
+            return "▲" if change >= 0 else "▼"
 
-    # ── [미국 증시] ──────────────────────────────────────────────────────
-    lines.append(f"📈 <b>[미국 증시]</b>{date_note}")
-    us_index_cfg = [
-        ("SP500",       "S&amp;P500"),
-        ("NASDAQ",      "나스닥100"),
-        ("DOW",         "다우"),
-        ("RUSSELL2000", "러셀2000"),
-    ]
-    for key, label in us_index_cfg:
-        if key in stocks:
-            info = stocks[key]
+        # ── [미국 증시] ──
+        lines.append(f"📈 <b>[미국 증시]</b>{date_note} <i>(참고)</i>")
+        us_index_cfg = [
+            ("SP500",       "S&amp;P500"),
+            ("NASDAQ",      "나스닥100"),
+            ("DOW",         "다우"),
+            ("RUSSELL2000", "러셀2000"),
+        ]
+        for key, label in us_index_cfg:
+            if key in stocks:
+                info = stocks[key]
+                sign = "+" if info["change_pct"] >= 0 else ""
+                lines.append(f"{label} {sign}{info['change_pct']:.2f}% → {info['current']:,.2f}")
+        lines.append("")
+
+        # ── [미국 국채] ──
+        rate_items = [(k, lbl) for k, lbl in [("US2Y", "2년 수익률"), ("US10Y", "10년 수익률")]
+                      if k in stocks]
+        if rate_items:
+            lines.append("🏦 <b>[미국 국채]</b>")
+            for key, label in rate_items:
+                info = stocks[key]
+                prev = _prev(info)
+                lines.append(f"{label} {prev:.3f}% → {info['current']:.3f}%  {_arrow(info['change'])}")
+            lines.append("")
+
+        # ── [달러 인덱스] ──
+        if "DXY" in stocks:
+            info = stocks["DXY"]
+            prev = _prev(info)
+            lines.append("💵 <b>[달러 인덱스]</b>")
+            lines.append(f"{prev:.3f} → {info['current']:.3f}  {_arrow(info['change'])}")
+            lines.append("")
+
+        # ── [골드] ──
+        if "GOLD" in stocks:
+            info = stocks["GOLD"]
+            prev = _prev(info)
+            lines.append("🥇 <b>[골드]</b>")
+            lines.append(f"{prev:,.2f} → {info['current']:,.2f}  {_arrow(info['change'])}")
+            lines.append("")
+
+        # ── [에너지] ──
+        energy_items = [(k, lbl, d) for k, lbl, d in
+                        [("WTI", "WTI", 2), ("NATGAS", "천연가스", 3)]
+                        if k in stocks]
+        if energy_items:
+            lines.append("🛢️ <b>[에너지]</b>")
+            for key, label, decimals in energy_items:
+                info = stocks[key]
+                prev = _prev(info)
+                fmt = f"{{:.{decimals}f}}"
+                lines.append(f"{label} {fmt.format(prev)} → {fmt.format(info['current'])}  {_arrow(info['change'])}")
+            lines.append("")
+
+        # ── [원/달러] ──
+        if "USDKRW" in stocks:
+            info = stocks["USDKRW"]
+            prev = _prev(info)
             sign = "+" if info["change_pct"] >= 0 else ""
+            lines.append("💱 <b>[원/달러]</b>")
             lines.append(
-                f"{label} {sign}{info['change_pct']:.2f}% → {info['current']:,.2f}"
+                f"{prev:,.2f} → {info['current']:,.2f}원  "
+                f"{_arrow(info['change'])} {sign}{info['change_pct']:.2f}%"
             )
-    lines.append("")
-
-    # ── [미국 국채] ──────────────────────────────────────────────────────
-    rate_items = [(k, lbl) for k, lbl in [("US2Y", "2년 수익률"), ("US10Y", "10년 수익률")]
-                  if k in stocks]
-    if rate_items:
-        lines.append("🏦 <b>[미국 국채]</b>")
-        for key, label in rate_items:
-            info = stocks[key]
-            prev = _prev(info)
-            lines.append(
-                f"{label} {prev:.3f}% → {info['current']:.3f}%  {_arrow(info['change'])}"
-            )
-        lines.append("")
-
-    # ── [달러 인덱스] ────────────────────────────────────────────────────
-    if "DXY" in stocks:
-        info = stocks["DXY"]
-        prev = _prev(info)
-        lines.append("💵 <b>[달러 인덱스]</b>")
-        lines.append(f"{prev:.3f} → {info['current']:.3f}  {_arrow(info['change'])}")
-        lines.append("")
-
-    # ── [골드] ───────────────────────────────────────────────────────────
-    if "GOLD" in stocks:
-        info = stocks["GOLD"]
-        prev = _prev(info)
-        lines.append("🥇 <b>[골드]</b>")
-        lines.append(f"{prev:,.2f} → {info['current']:,.2f}  {_arrow(info['change'])}")
-        lines.append("")
-
-    # ── [에너지] ─────────────────────────────────────────────────────────
-    energy_items = [(k, lbl, d) for k, lbl, d in
-                    [("WTI", "WTI", 2), ("NATGAS", "천연가스", 3)]
-                    if k in stocks]
-    if energy_items:
-        lines.append("🛢️ <b>[에너지]</b>")
-        for key, label, decimals in energy_items:
-            info = stocks[key]
-            prev = _prev(info)
-            fmt = f"{{:.{decimals}f}}"
-            lines.append(
-                f"{label} {fmt.format(prev)} → {fmt.format(info['current'])}  {_arrow(info['change'])}"
-            )
-        lines.append("")
-
-    # ── [원/달러] ────────────────────────────────────────────────────────
-    if "USDKRW" in stocks:
-        info = stocks["USDKRW"]
-        prev = _prev(info)
-        sign = "+" if info["change_pct"] >= 0 else ""
-        lines.append("💱 <b>[원/달러]</b>")
-        lines.append(
-            f"{prev:,.2f} → {info['current']:,.2f}원  "
-            f"{_arrow(info['change'])} {sign}{info['change_pct']:.2f}%"
-        )
-        lines.append("")
+            lines.append("")
 
     # ─────────────────────────────────────────────────────────────────────
-    # AI 분석 없을 때 조기 종료
+    # AI 분석 없을 때: 시장 데이터(참고)만 표시 후 종료
     # ─────────────────────────────────────────────────────────────────────
     if not briefing:
+        _emit_market_data()
         lines.append("⚠️ AI 분석을 불러올 수 없습니다.")
         lines.append("")
         lines.append("⚠️ 본 정보는 투자 권유가 아니며 투자 판단의 책임은 본인에게 있습니다.")
         return "\n".join(lines)
 
-    # ── ③ 핵심 이슈 ──────────────────────────────────────────────────────
-    key_issues = briefing.get("key_issues", [])
-    if key_issues:
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("🔍 <b>핵심 이슈</b>")
-        for issue in key_issues:
-            icon = issue.get("icon", "•")
-            category = issue.get("category", "")
-            title = _safe_html(issue.get("title", ""))
-            why = _safe_html(issue.get("why_important", issue.get("impact", "")))
-            swing = _safe_html(issue.get("swing_point", ""))
-
-            lines.append(f"{icon} [{category}] {title}")
-            if why:
-                lines.append(f"  📌 {why}")
-            if swing:
-                lines.append(f"  🎯 {swing}")
+    # ── ② 향후 60일 주요 일정 (승격, 메시지 중심) ───────────────────────
+    upcoming = briefing.get("upcoming_schedule") or {}
+    tiers = [
+        ("this_week",     "📅 <b>향후 60일 주요 일정 — 이번 주</b>", " ⭐⭐"),
+        ("this_month",    "🗓️ <b>이번 달 (8~30일 내)</b>",          " ⭐"),
+        ("next_2_months", "📆 <b>다음 한 달 (31~60일 내)</b>",        ""),
+    ]
+    any_printed = False
+    for key, header, star_suffix in tiers:
+        items = upcoming.get(key) or []
+        if not items:
+            continue
+        if not any_printed:
+            lines.append("━━━━━━━━━━━━━━━━━━━━")
+            any_printed = True
+        lines.append(header)
+        for item in items:
+            date = item.get("date", "")
+            event = _safe_html(item.get("event", ""))
+            ticker = _safe_html(item.get("ticker", ""))
+            sector = _safe_html(item.get("sector_kr", ""))
+            detail = _safe_html(item.get("detail", ""))
+            # 실적 발표 vs 일반 이벤트 표시 구분 (⚠️/분산은 detail 에 이미 포함)
+            if ticker:
+                head = f"• {date} <b>{event}</b>({ticker}) [{sector}]{star_suffix}"
+            else:
+                head = f"• {date} <b>{event}</b>{star_suffix}"
+            lines.append(head)
+            if detail:
+                lines.append(f"    {detail}")
         lines.append("")
 
-    # ── ④ 오늘의 주도 섹터 ───────────────────────────────────────────────
+    # ── ③ 현재 주도 섹터 ─────────────────────────────────────────────────
     leading_sectors = briefing.get("leading_sectors", [])
     if leading_sectors:
         lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("🚀 <b>오늘의 주도 섹터</b>")
+        lines.append("🚀 <b>현재 주도 섹터</b>")
         for sector in leading_sectors:
             emoji = sector.get("emoji", "")
             name = _safe_html(sector.get("name", ""))
@@ -384,7 +388,31 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
                 lines.append(f"  🇺🇸 {stocks_us}")
         lines.append("")
 
-    # ── ⑤ 스윙 체크포인트 ───────────────────────────────────────────────
+    # ── ④ 핵심 테마 (1~3개월) ────────────────────────────────────────────
+    themes = briefing.get("key_themes", [])
+    if themes:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("🔍 <b>핵심 테마 (1~3개월)</b>")
+        for item in themes:
+            icon = item.get("icon", "🟡")
+            category = item.get("category", "")
+            title = item.get("title", "")
+            why = item.get("why_important", "")
+            duration = item.get("duration", "")
+            swing_pt = item.get("swing_point", "")
+            lines.append(f"{icon} [{_safe_html(category)}] <b>{_safe_html(title)}</b>")
+            if duration:
+                lines.append(f"  ⏱️ 지속: {_safe_html(duration)}")
+            if why:
+                lines.append(f"  📌 {_safe_html(why)}")
+            if swing_pt:
+                lines.append(f"  🎯 {_safe_html(swing_pt)}")
+        lines.append("")
+
+    # ── ⑤ 시장 데이터 (참고) ─────────────────────────────────────────────
+    _emit_market_data()
+
+    # ── ⑥ 스윙 체크포인트 ───────────────────────────────────────────────
     swing = briefing.get("swing_check", {})
     if swing:
         lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -407,21 +435,20 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
                 lines.append(f"  • {_safe_html(r)}")
         lines.append("")
 
-    # ── ⑥ 이번 주 주요 일정 ─────────────────────────────────────────────
-    schedule = briefing.get("weekly_schedule", [])
-    if schedule:
+    # ── ⑦ 액션 포인트 (v1.5.7) ───────────────────────────────────────────
+    adjustment = briefing.get("portfolio_adjustment") or {}
+    passive_note = (adjustment.get("passive_note") or "").strip()
+    swing_candidates = adjustment.get("swing_candidates") or []
+    swing_candidates = [s for s in swing_candidates if s and s.strip()]
+    if passive_note or swing_candidates:
         lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("📅 <b>이번 주 주요 일정</b>")
-        star_map = {1: "", 2: " ⭐", 3: " ⭐⭐"}
-        for item in schedule:
-            date = item.get("date", "")
-            event = _safe_html(item.get("event", ""))
-            detail = _safe_html(item.get("detail", ""))
-            importance = item.get("importance", 1)
-            stars_str = star_map.get(importance, "")
-            lines.append(f"• {date} {event}{stars_str}")
-            if detail:
-                lines.append(f"  {detail}")
+        lines.append("💼 <b>액션 포인트</b>")
+        if passive_note:
+            lines.append(f"📊 패시브: {_safe_html(passive_note)}")
+        if swing_candidates:
+            lines.append("🎯 스윙 진입 후보:")
+            for s in swing_candidates[:2]:
+                lines.append(f"  • {_safe_html(s)}")
         lines.append("")
 
     lines.append("⚠️ 본 정보는 투자 권유가 아니며 투자 판단의 책임은 본인에게 있습니다.")
@@ -435,16 +462,16 @@ def format_morning_message(stocks: dict, briefing, today_str: str) -> str:
 def format_afternoon_message(stocks: dict, briefing, today_str: str) -> str:
     """오후 브리핑 텔레그램 HTML 메시지를 포맷팅합니다 (오선 스타일).
 
-    구조:
+    구조 (v1.5.7: 방향성 중심 재배치):
         헤더
-        ① 오늘 시장 총평 + VIX 코멘트 + 포트폴리오 한줄
-        ② 시장 데이터 (오선 스타일)
-           [국내 지수] KOSPI / KOSDAQ
-           [공포지수] VIX
-        ③ 핵심 이슈 3선
-        ④ 오늘의 주도 섹터
-        ⑤ 스윙 트레이딩 체크포인트
-        ⑥ 이번 주 주요 일정
+        ① 시장 총평 + VIX 코멘트 + 포트폴리오 한줄
+        ② 향후 60일 주요 일정 (승격, 메시지 중심)
+        ③ 현재 주도 섹터
+        ④ 핵심 테마 (1~3개월, duration 명시)
+        ⑤ 시장 데이터 (참고)
+           [국내 지수] KOSPI / KOSDAQ / [공포지수] VIX
+        ⑥ 스윙 트레이딩 체크포인트
+        ⑦ 액션 포인트 (패시브 비중 조정 + 스윙 후보)
         면책 문구
     """
     now_kst = datetime.now(KST)
@@ -471,79 +498,90 @@ def format_afternoon_message(stocks: dict, briefing, today_str: str) -> str:
     lines.append("")
 
     # ─────────────────────────────────────────────────────────────────────
-    # ② 시장 데이터 (오선 스타일)
+    # 시장 데이터 블록 (v1.5.7: ⑤ 위치, 참고용) — 함수로 분리해 재사용
     # ─────────────────────────────────────────────────────────────────────
-    kr_data_date = stocks.get("KOSPI", {}).get("data_date", "")
-    date_note = f"  <i>※ {kr_data_date} 종가 기준</i>" if kr_data_date else ""
-    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    def _emit_market_data():
+        kr_data_date = stocks.get("KOSPI", {}).get("data_date", "")
+        date_note = f"  <i>※ {kr_data_date} 종가 기준</i>" if kr_data_date else ""
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
 
-    def _prev(info: dict) -> float:
-        return info["current"] - info["change"]
+        def _prev(info: dict) -> float:
+            return info["current"] - info["change"]
 
-    def _arrow(change: float) -> str:
-        return "▲" if change >= 0 else "▼"
+        def _arrow(change: float) -> str:
+            return "▲" if change >= 0 else "▼"
 
-    # ── [국내 지수] ──────────────────────────────────────────────────────
-    lines.append(f"📈 <b>[국내 지수]</b>{date_note}")
-    for key, label in [("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")]:
-        if key in stocks:
-            info = stocks[key]
-            sign = "+" if info["change_pct"] >= 0 else ""
-            lines.append(
-                f"{label} {sign}{info['change_pct']:.2f}% → {info['current']:,.2f}"
-            )
-    lines.append("")
-
-    # ── [공포지수] ───────────────────────────────────────────────────────
-    vix_info = stocks.get("VIX", {})
-    if vix_info:
-        vix_val = vix_info["current"]
-        prev_vix = round(_prev(vix_info), 2)
-        if vix_val >= 30:
-            vix_label = "😱 VIX (공포 구간)"
-        elif vix_val >= 20:
-            vix_label = "😟 VIX (주의 구간)"
-        else:
-            vix_label = "😊 VIX (안정 구간)"
-        lines.append("🌡️ <b>[공포지수]</b>")
-        lines.append(
-            f"{vix_label}  {prev_vix:.2f} → {vix_val:.2f}  {_arrow(vix_info['change'])}"
-        )
+        # ── [국내 지수] ──
+        lines.append(f"📈 <b>[국내 지수]</b>{date_note} <i>(참고)</i>")
+        for key, label in [("KOSPI", "KOSPI"), ("KOSDAQ", "KOSDAQ")]:
+            if key in stocks:
+                info = stocks[key]
+                sign = "+" if info["change_pct"] >= 0 else ""
+                lines.append(f"{label} {sign}{info['change_pct']:.2f}% → {info['current']:,.2f}")
         lines.append("")
 
+        # ── [공포지수] ──
+        vix_info = stocks.get("VIX", {})
+        if vix_info:
+            vix_val = vix_info["current"]
+            prev_vix = round(_prev(vix_info), 2)
+            if vix_val >= 30:
+                vix_label = "😱 VIX (공포 구간)"
+            elif vix_val >= 20:
+                vix_label = "😟 VIX (주의 구간)"
+            else:
+                vix_label = "😊 VIX (안정 구간)"
+            lines.append("🌡️ <b>[공포지수]</b>")
+            lines.append(f"{vix_label}  {prev_vix:.2f} → {vix_val:.2f}  {_arrow(vix_info['change'])}")
+            lines.append("")
+
     # ─────────────────────────────────────────────────────────────────────
-    # AI 분석 없을 때 조기 종료
+    # AI 분석 없을 때: 시장 데이터(참고)만 표시 후 종료
     # ─────────────────────────────────────────────────────────────────────
     if not briefing:
+        _emit_market_data()
         lines.append("⚠️ AI 분석을 불러올 수 없습니다.")
         lines.append("")
         lines.append("⚠️ 본 정보는 투자 권유가 아니며 투자 판단의 책임은 본인에게 있습니다.")
         return "\n".join(lines)
 
-    # ── ③ 핵심 이슈 ──────────────────────────────────────────────────────
-    key_issues = briefing.get("key_issues", [])
-    if key_issues:
-        lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("🔍 <b>핵심 이슈</b>")
-        for issue in key_issues:
-            icon = issue.get("icon", "•")
-            category = issue.get("category", "")
-            title = _safe_html(issue.get("title", ""))
-            why = _safe_html(issue.get("why_important", issue.get("impact", "")))
-            swing = _safe_html(issue.get("swing_point", ""))
-
-            lines.append(f"{icon} [{category}] {title}")
-            if why:
-                lines.append(f"  📌 {why}")
-            if swing:
-                lines.append(f"  🎯 {swing}")
+    # ── ② 향후 60일 주요 일정 (승격, 메시지 중심) ───────────────────────
+    upcoming = briefing.get("upcoming_schedule") or {}
+    tiers = [
+        ("this_week",     "📅 <b>향후 60일 주요 일정 — 이번 주</b>", " ⭐⭐"),
+        ("this_month",    "🗓️ <b>이번 달 (8~30일 내)</b>",          " ⭐"),
+        ("next_2_months", "📆 <b>다음 한 달 (31~60일 내)</b>",        ""),
+    ]
+    any_printed = False
+    for key, header, star_suffix in tiers:
+        items = upcoming.get(key) or []
+        if not items:
+            continue
+        if not any_printed:
+            lines.append("━━━━━━━━━━━━━━━━━━━━")
+            any_printed = True
+        lines.append(header)
+        for item in items:
+            date = item.get("date", "")
+            event = _safe_html(item.get("event", ""))
+            ticker = _safe_html(item.get("ticker", ""))
+            sector = _safe_html(item.get("sector_kr", ""))
+            detail = _safe_html(item.get("detail", ""))
+            # 실적 발표 vs 일반 이벤트 표시 구분 (⚠️/분산은 detail 에 이미 포함)
+            if ticker:
+                head = f"• {date} <b>{event}</b>({ticker}) [{sector}]{star_suffix}"
+            else:
+                head = f"• {date} <b>{event}</b>{star_suffix}"
+            lines.append(head)
+            if detail:
+                lines.append(f"    {detail}")
         lines.append("")
 
-    # ── ④ 오늘의 주도 섹터 ───────────────────────────────────────────────
+    # ── ③ 현재 주도 섹터 ─────────────────────────────────────────────────
     leading_sectors = briefing.get("leading_sectors", [])
     if leading_sectors:
         lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("🚀 <b>오늘의 주도 섹터</b>")
+        lines.append("🚀 <b>현재 주도 섹터</b>")
         for sector in leading_sectors:
             emoji = sector.get("emoji", "")
             name = _safe_html(sector.get("name", ""))
@@ -561,7 +599,31 @@ def format_afternoon_message(stocks: dict, briefing, today_str: str) -> str:
                 lines.append(f"  🇺🇸 {stocks_us}")
         lines.append("")
 
-    # ── ⑤ 스윙 체크포인트 ───────────────────────────────────────────────
+    # ── ④ 핵심 테마 (1~3개월) ────────────────────────────────────────────
+    themes = briefing.get("key_themes", [])
+    if themes:
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append("🔍 <b>핵심 테마 (1~3개월)</b>")
+        for item in themes:
+            icon = item.get("icon", "🟡")
+            category = item.get("category", "")
+            title = item.get("title", "")
+            why = item.get("why_important", "")
+            duration = item.get("duration", "")
+            swing_pt = item.get("swing_point", "")
+            lines.append(f"{icon} [{_safe_html(category)}] <b>{_safe_html(title)}</b>")
+            if duration:
+                lines.append(f"  ⏱️ 지속: {_safe_html(duration)}")
+            if why:
+                lines.append(f"  📌 {_safe_html(why)}")
+            if swing_pt:
+                lines.append(f"  🎯 {_safe_html(swing_pt)}")
+        lines.append("")
+
+    # ── ⑤ 시장 데이터 (참고) ─────────────────────────────────────────────
+    _emit_market_data()
+
+    # ── ⑥ 스윙 체크포인트 ───────────────────────────────────────────────
     swing = briefing.get("swing_check", {})
     if swing:
         lines.append("━━━━━━━━━━━━━━━━━━━━")
@@ -584,21 +646,20 @@ def format_afternoon_message(stocks: dict, briefing, today_str: str) -> str:
                 lines.append(f"  • {_safe_html(r)}")
         lines.append("")
 
-    # ── ⑥ 이번 주 주요 일정 ─────────────────────────────────────────────
-    schedule = briefing.get("weekly_schedule", [])
-    if schedule:
+    # ── ⑦ 액션 포인트 (v1.5.7) ───────────────────────────────────────────
+    adjustment = briefing.get("portfolio_adjustment") or {}
+    passive_note = (adjustment.get("passive_note") or "").strip()
+    swing_candidates = adjustment.get("swing_candidates") or []
+    swing_candidates = [s for s in swing_candidates if s and s.strip()]
+    if passive_note or swing_candidates:
         lines.append("━━━━━━━━━━━━━━━━━━━━")
-        lines.append("📅 <b>이번 주 주요 일정</b>")
-        star_map = {1: "", 2: " ⭐", 3: " ⭐⭐"}
-        for item in schedule:
-            date = item.get("date", "")
-            event = _safe_html(item.get("event", ""))
-            detail = _safe_html(item.get("detail", ""))
-            importance = item.get("importance", 1)
-            stars_str = star_map.get(importance, "")
-            lines.append(f"• {date} {event}{stars_str}")
-            if detail:
-                lines.append(f"  {detail}")
+        lines.append("💼 <b>액션 포인트</b>")
+        if passive_note:
+            lines.append(f"📊 패시브: {_safe_html(passive_note)}")
+        if swing_candidates:
+            lines.append("🎯 스윙 진입 후보:")
+            for s in swing_candidates[:2]:
+                lines.append(f"  • {_safe_html(s)}")
         lines.append("")
 
     lines.append("⚠️ 본 정보는 투자 권유가 아니며 투자 판단의 책임은 본인에게 있습니다.")
