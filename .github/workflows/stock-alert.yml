@@ -1,12 +1,12 @@
 name: 주식 정보 자동 알림
 
 on:
-  # v1.5.6: 사용자 결정으로 schedule 자동 트리거 부활 (수동 workflow_dispatch 병행)
-  # ⚠️ trade-off: GitHub Actions schedule 큐 지연(최대 ~5h 관측) 가능성 잔존.
+  # v1.5.11: 오전 평일 1회 자동 발사. 오후는 workflow_dispatch 로 수동 발사.
+  # cron '55' 은 정각 :00 회피로 GitHub Actions 큐 지연 완화 목표.
+  # ⚠️ trade-off: GitHub Actions schedule 큐 지연(~수십 분 ~ 수 시간) 가능성 잔존.
   #    정시 도착이 필요하면 "Run workflow" 수동 트리거 사용.
   schedule:
-    - cron: '30 22 * * 0-4'  # UTC 일~목 22:30 → KST 월~금 07:30 오전 브리핑
-    - cron: '30 7 * * 1-5'   # UTC 월~금 07:30 → KST 월~금 16:30 오후 브리핑
+    - cron: '55 22 * * 0-4'  # UTC 일~목 22:55 → KST 월~금 07:55 오전 브리핑
   workflow_dispatch:
     inputs:
       mode:
@@ -42,7 +42,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "RUN_MODE=${{ github.event.inputs.mode }}" >> $GITHUB_ENV
           else
-            # 폴백: KST 13시 경계 (schedule cron 및 외부 트리거 — 07:30→morning, 16:30→afternoon)
+            # 폴백: KST 13시 경계 (schedule cron 07:55 → morning. 외부 오후 트리거 추가 시 16시대 → afternoon)
             HOUR=$(TZ=Asia/Seoul date +%H)
             if [ "$HOUR" -lt 13 ]; then
               echo "RUN_MODE=morning"   >> $GITHUB_ENV
