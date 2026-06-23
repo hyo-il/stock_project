@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -26,11 +27,24 @@ logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 MODEL_NAME = "gemini-2.5-flash"
+MAX_AI_ATTEMPTS = 3  # v1.5.12: 2 → 3 (503 high demand spike 대응)
 
 
 # ---------------------------------------------------------------------------
 # Gemini 클라이언트 / 설정 헬퍼
 # ---------------------------------------------------------------------------
+
+def _ai_retry_backoff(attempt: int) -> None:
+    """v1.5.12: Gemini 재시도 사이 선형 백오프. 시도1 실패 후 5초, 시도2 실패 후 10초.
+
+    503 (high demand spike) 등 일시 장애 흡수용. 마지막 시도 뒤에는 대기하지 않음.
+    Google 공식 권고 "Spikes in demand are usually temporary. Please try again later." 대응.
+    """
+    if attempt < MAX_AI_ATTEMPTS - 1:
+        wait_seconds = 5 * (attempt + 1)
+        logger.info("Gemini 재시도 대기 %d초", wait_seconds)
+        time.sleep(wait_seconds)
+
 
 def _get_gemini_client():
     """Gemini API 클라이언트를 반환합니다. API 키 없거나 패키지 미설치 시 None 반환."""
@@ -415,14 +429,14 @@ def build_morning_briefing(
   ★ 투자 권유 표현 금지 ("매수하세요" 등). 권유성은 "진입 후보로 검토 가능" 형태로.
 - 인사말·서문·결론 문구 금지."""
 
-    # ── Gemini 호출 (최대 2회 시도) ─────────────────────────────────────
+    # ── Gemini 호출 (최대 3회 시도 + 선형 백오프, v1.5.12) ───────────────
     json_config = _make_json_gen_config()
     kwargs = {"model": MODEL_NAME, "contents": prompt}
     if json_config:
         kwargs["config"] = json_config
 
     last_response_text = None
-    for attempt in range(2):
+    for attempt in range(MAX_AI_ATTEMPTS):
         try:
             response = client.models.generate_content(**kwargs)
             last_response_text = response.text
@@ -432,7 +446,8 @@ def build_morning_briefing(
             required = ["market_regime", "key_themes", "leading_sectors", "swing_check", "upcoming_schedule", "portfolio_adjustment"]
             missing = [k for k in required if k not in result]
             if missing:
-                logger.warning("[시도 %d] 누락된 키: %s. 재시도합니다.", attempt + 1, missing)
+                logger.warning("[시도 %d/%d] 누락된 키: %s. 재시도합니다.", attempt + 1, MAX_AI_ATTEMPTS, missing)
+                _ai_retry_backoff(attempt)
                 continue
 
             logger.info("오전 브리핑 AI 분석 완료 (%d자)", len(response.text))
@@ -441,11 +456,12 @@ def build_morning_briefing(
             return result
 
         except Exception as e:
-            logger.error("[시도 %d] Gemini 오전 브리핑 분석 실패: %s", attempt + 1, e)
+            logger.error("[시도 %d/%d] Gemini 오전 브리핑 분석 실패: %s", attempt + 1, MAX_AI_ATTEMPTS, e)
             if last_response_text:
                 logger.debug("응답 원시 텍스트 (첫 500자): %s", last_response_text[:500])
+            _ai_retry_backoff(attempt)
 
-    logger.error("Gemini 분석 2회 모두 실패.")
+    logger.error("Gemini 분석 %d회 모두 실패.", MAX_AI_ATTEMPTS)
     return None
 
 
@@ -673,14 +689,14 @@ def build_afternoon_briefing(
   ★ 투자 권유 표현 금지 ("매수하세요" 등). 권유성은 "진입 후보로 검토 가능" 형태로.
 - 인사말·서문·결론 문구 금지."""
 
-    # ── Gemini 호출 (최대 2회 시도) ─────────────────────────────────────
+    # ── Gemini 호출 (최대 3회 시도 + 선형 백오프, v1.5.12) ───────────────
     json_config = _make_json_gen_config()
     kwargs = {"model": MODEL_NAME, "contents": prompt}
     if json_config:
         kwargs["config"] = json_config
 
     last_response_text = None
-    for attempt in range(2):
+    for attempt in range(MAX_AI_ATTEMPTS):
         try:
             response = client.models.generate_content(**kwargs)
             last_response_text = response.text
@@ -689,7 +705,8 @@ def build_afternoon_briefing(
             required = ["market_summary", "key_themes", "leading_sectors", "swing_check", "upcoming_schedule", "portfolio_adjustment"]
             missing = [k for k in required if k not in result]
             if missing:
-                logger.warning("[시도 %d] 누락된 키: %s. 재시도합니다.", attempt + 1, missing)
+                logger.warning("[시도 %d/%d] 누락된 키: %s. 재시도합니다.", attempt + 1, MAX_AI_ATTEMPTS, missing)
+                _ai_retry_backoff(attempt)
                 continue
 
             logger.info("오후 브리핑 AI 분석 완료 (%d자)", len(response.text))
@@ -698,9 +715,10 @@ def build_afternoon_briefing(
             return result
 
         except Exception as e:
-            logger.error("[시도 %d] Gemini 오후 브리핑 분석 실패: %s", attempt + 1, e)
+            logger.error("[시도 %d/%d] Gemini 오후 브리핑 분석 실패: %s", attempt + 1, MAX_AI_ATTEMPTS, e)
             if last_response_text:
                 logger.debug("응답 원시 텍스트 (첫 500자): %s", last_response_text[:500])
+            _ai_retry_backoff(attempt)
 
-    logger.error("Gemini 오후 브리핑 분석 2회 모두 실패.")
+    logger.error("Gemini 오후 브리핑 분석 %d회 모두 실패.", MAX_AI_ATTEMPTS)
     return None
