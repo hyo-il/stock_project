@@ -6,7 +6,8 @@ on:
   # ⚠️ trade-off: GitHub Actions schedule 큐 지연(~수십 분 ~ 수 시간) 가능성 잔존.
   #    정시 도착이 필요하면 "Run workflow" 수동 트리거 사용.
   schedule:
-    - cron: '55 22 * * 0-4'  # UTC 일~목 22:55 → KST 월~금 07:55 오전 브리핑
+    - cron: '55 21 * * 0-4'  # UTC 일~목 21:55 → KST 월~금 06:55 오전 브리핑
+                              # v1.5.13: 큐 지연 평균 ~60분 흡수 목적
   workflow_dispatch:
     inputs:
       mode:
