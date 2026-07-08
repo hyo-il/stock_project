@@ -16,6 +16,64 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 
 
+def _is_korean_ticker(ticker: str) -> bool:
+    """티커 접미사로 국내 종목 여부 판정 (v1.5.14).
+
+    KRX 종목은 yfinance 에서 .KS (KOSPI) 또는 .KQ (KOSDAQ) 접미사 사용.
+    통화 표기·타임존 처리를 미국 종목과 분기하기 위한 판정.
+    """
+    if not ticker:
+        return False
+    return ticker.endswith('.KS') or ticker.endswith('.KQ')
+
+
+def _fmt_eps(value, ticker: str = None) -> str:
+    """EPS 값을 통화별 형식으로 반환.
+
+    v1.5.14: 티커 접미사(.KS/.KQ)로 국내 종목 감지해 ₩ 표기 분기.
+    - 국내: ₩7,240 (원 단위 정수)
+    - 미국: $20.05 (달러 소수 2자리, 기존 동작)
+    """
+    if value is None:
+        return "-"
+    try:
+        v = float(value)
+        if ticker and _is_korean_ticker(ticker):
+            return f"₩{int(round(v)):,}"
+        return f"${v:.2f}"
+    except Exception:
+        return "-"
+
+
+def _fmt_money(value, suffix: str = "", ticker: str = None) -> str:
+    """금액(매출 등)을 통화별 형식으로 반환.
+
+    v1.5.14: 티커 접미사로 국내 종목 감지해 조/억 표기 분기.
+    - 국내: ₩202조, ₩5,432억
+    - 미국: $30.2B, $500M (기존 동작)
+    """
+    if value is None:
+        return "-"
+    try:
+        v = float(value)
+        if ticker and _is_korean_ticker(ticker):
+            if abs(v) >= 1e12:
+                return f"₩{v/1e12:.1f}조{suffix}"
+            if abs(v) >= 1e8:
+                return f"₩{v/1e8:,.0f}억{suffix}"
+            return f"₩{v:,.0f}{suffix}"
+        # USD (기존)
+        if abs(v) >= 1e12:
+            return f"${v/1e12:.2f}T{suffix}"
+        if abs(v) >= 1e9:
+            return f"${v/1e9:.2f}B{suffix}"
+        if abs(v) >= 1e6:
+            return f"${v/1e6:.2f}M{suffix}"
+        return f"${v:.2f}{suffix}"
+    except Exception:
+        return "-"
+
+
 def _yf_earnings_dates_safe(ticker: str, per_call_timeout: float = 10.0):
     """yfinance Ticker.earnings_dates 호출에 스레드 타임아웃을 강제합니다.
 
@@ -233,6 +291,9 @@ EXTENDED_TICKERS = {
     "AMAT":  ("어플라이드머티어리얼즈", "반도체"),
     "MU":    ("마이크론",        "반도체"),
     "ASML":  ("ASML",            "반도체"),
+    # ── 국내 대형주 (v1.5.14 사용자 정책 반영: 분할상장·부진 계열 제외) ──
+    "005930.KS": ("삼성전자",     "반도체"),
+    "000660.KS": ("SK하이닉스",   "반도체"),
 
     # ── 소프트웨어 / 엔터프라이즈 ──────────────────────────
     "ORCL":  ("오라클",          "소프트웨어"),
@@ -371,30 +432,6 @@ def collect_upcoming_earnings(days_ahead: int = 60) -> list:
         except Exception:
             return ""
 
-    def _fmt_money(value, suffix: str = "") -> str:
-        """달러 금액을 사람이 읽기 쉬운 형식으로 변환. 1.0e9 → '$1.0B'."""
-        if value is None:
-            return "-"
-        try:
-            v = float(value)
-            if abs(v) >= 1e12:
-                return f"${v/1e12:.2f}T{suffix}"
-            if abs(v) >= 1e9:
-                return f"${v/1e9:.2f}B{suffix}"
-            if abs(v) >= 1e6:
-                return f"${v/1e6:.2f}M{suffix}"
-            return f"${v:.2f}{suffix}"
-        except Exception:
-            return "-"
-
-    def _fmt_eps(value) -> str:
-        if value is None:
-            return "-"
-        try:
-            return f"${float(value):.2f}"
-        except Exception:
-            return "-"
-
     def _fmt_recommendation(rec_dict) -> str:
         if not rec_dict or rec_dict.get("total", 0) == 0:
             return "-"
@@ -427,7 +464,10 @@ def collect_upcoming_earnings(days_ahead: int = 60) -> list:
         future = ed[ed["Reported EPS"].isna()].copy()
         if future.empty:
             return None
-        future.index = future.index.tz_localize(None) if future.index.tz else future.index
+        # v1.5.14: yfinance 는 US/Eastern 반환. KST 로 변환한 뒤 naive 처리.
+        # 안 하면 미국 종목은 영향 없으나 국내 종목(및 일부 미국 저녁 발표)의 date 가 +1일 밀릴 위험.
+        if future.index.tz is not None:
+            future.index = future.index.tz_convert(KST).tz_localize(None)
         future_dates = future.index.date
         mask = (future_dates >= today) & (future_dates <= end_date)
         upcoming = future[mask]
@@ -552,12 +592,12 @@ def collect_upcoming_earnings(days_ahead: int = 60) -> list:
             "earnings_date":             _fmt_date(p1["date_obj"]),
             "days_until":                days_until,
             # 기존 4종 (v1.5.6)
-            "eps_estimate":              _fmt_eps(eps_est_raw),
-            "revenue_estimate":          "-" if revenue_sanity_flag else _fmt_money(revenue_avg_raw),
-            "yoy_eps_actual":            _fmt_eps(year_ago_eps),
+            "eps_estimate":              _fmt_eps(eps_est_raw, t),
+            "revenue_estimate":          "-" if revenue_sanity_flag else _fmt_money(revenue_avg_raw, ticker=t),
+            "yoy_eps_actual":            _fmt_eps(year_ago_eps, t),
             "recommendation":            _fmt_recommendation(rec_dict),
             # v1.5.7 신규
-            "last_quarter_eps_actual":   _fmt_eps(last_quarter_eps),
+            "last_quarter_eps_actual":   _fmt_eps(last_quarter_eps, t),
             "eps_dispersion":            eps_dispersion_str,
             "eps_sanity_flag":           eps_sanity_flag,
             "revenue_sanity_flag":       revenue_sanity_flag,
