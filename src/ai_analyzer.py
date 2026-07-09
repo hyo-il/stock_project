@@ -204,6 +204,160 @@ def _filter_upcoming_by_leading_sectors(briefing: dict) -> dict:
     return briefing
 
 
+def _reassign_upcoming_slots_by_days(briefing: dict, today) -> dict:
+    """upcoming_schedule 항목을 실제 날짜(MM/DD) 기반 days_until 로 재배치.
+
+    v1.5.16 도입. AI 가 D+N 값을 준수하지 않는 경우 대응하는 안전망.
+    각 항목의 date (MM/DD 형식) 를 파싱해 today 대비 며칠 후 계산 후:
+        · 0~7일: this_week
+        · 8~30일: this_month
+        · 31~60일: next_2_months
+        · 그 외: this_month 에 폴백 (파싱 실패) 또는 삭제 (>60일)
+
+    Args:
+        briefing: AI 응답 dict
+        today: KST 기준 오늘 (datetime.date)
+
+    Returns:
+        재배치된 briefing (원본 mutate).
+    """
+    import re
+    from datetime import date as _date
+
+    if not isinstance(briefing, dict):
+        return briefing
+
+    us = briefing.get('upcoming_schedule') or {}
+    if not isinstance(us, dict):
+        return briefing
+
+    # 기존 모든 슬롯에서 항목 수집
+    all_items = []
+    for slot in ['this_week', 'this_month', 'next_2_months']:
+        items = us.get(slot, []) or []
+        all_items.extend(items)
+
+    def _calc_days(item):
+        """item['date'] (MM/DD 형식) → 오늘 대비 며칠 후. 실패 시 None."""
+        date_str = item.get('date', '') if isinstance(item, dict) else ''
+        m = re.match(r'(\d{1,2})/(\d{1,2})', date_str)
+        if not m:
+            return None
+        mm, dd = int(m.group(1)), int(m.group(2))
+        try:
+            candidate = _date(today.year, mm, dd)
+            # MM 이 오늘보다 이전이면 다음 해로 추정 (연도 경계)
+            if candidate < today:
+                candidate = _date(today.year + 1, mm, dd)
+            return (candidate - today).days
+        except ValueError:
+            return None
+
+    new_slots = {'this_week': [], 'this_month': [], 'next_2_months': []}
+    for item in all_items:
+        if not isinstance(item, dict):
+            continue
+        days = _calc_days(item)
+        if days is None:
+            # 파싱 실패 시 안전하게 this_month 로 폴백
+            new_slots['this_month'].append(item)
+            continue
+        if 0 <= days <= 7:
+            new_slots['this_week'].append(item)
+        elif 8 <= days <= 30:
+            new_slots['this_month'].append(item)
+        elif 31 <= days <= 60:
+            new_slots['next_2_months'].append(item)
+        # 60일 초과는 삭제 (수집 기간 밖)
+
+    us['this_week'] = new_slots['this_week']
+    us['this_month'] = new_slots['this_month']
+    us['next_2_months'] = new_slots['next_2_months']
+
+    logger.info(
+        "[재배치] this_week=%d, this_month=%d, next_2_months=%d",
+        len(new_slots['this_week']),
+        len(new_slots['this_month']),
+        len(new_slots['next_2_months']),
+    )
+    return briefing
+
+
+def _cap_and_sort_by_sector_priority(briefing: dict) -> dict:
+    """섹터별 상한 적용 + 주도섹터 별점 순 우선 정렬.
+
+    v1.5.16 도입.
+    - 각 슬롯 내에서 (leading_sector 별점 내림차순, 날짜 오름차순) 정렬
+    - 섹터별 상한 적용:
+        · this_week / this_month: 동일 섹터 최대 3개
+        · next_2_months: 동일 섹터 최대 2개
+    - 슬롯 총 상한(6/5/5) 도 함께 적용
+    - sector_kr 이 빈 문자열(경제지표·FOMC) 은 섹터 상한 적용 없이 보존
+
+    별점 매핑:
+        ★★★ = 3, ★★☆ = 2, ★☆☆ = 1 (leading_sectors[i].stars 문자열의 ★ 개수)
+        leading_sectors 에 없는 섹터 = 0 (하위 우선순위)
+    """
+    if not isinstance(briefing, dict):
+        return briefing
+
+    us = briefing.get('upcoming_schedule') or {}
+    if not isinstance(us, dict):
+        return briefing
+
+    # leading_sectors 별점 매핑
+    star_map = {}
+    for ls in briefing.get('leading_sectors', []) or []:
+        name = (ls.get('name') or '').strip()
+        stars = ls.get('stars', '') or ''
+        if name:
+            star_map[name] = stars.count('★')
+
+    slot_config = {
+        'this_week':     {'sector_cap': 3, 'total_cap': 6},
+        'this_month':    {'sector_cap': 3, 'total_cap': 5},
+        'next_2_months': {'sector_cap': 2, 'total_cap': 5},
+    }
+
+    for slot, cfg in slot_config.items():
+        items = us.get(slot, []) or []
+
+        def _sort_key(item):
+            sector = (item.get('sector_kr') or '').strip()
+            date_str = item.get('date', '')
+            priority = star_map.get(sector, 0)
+            return (-priority, date_str)
+
+        items_sorted = sorted(
+            [i for i in items if isinstance(i, dict)], key=_sort_key
+        )
+
+        sector_count = {}
+        kept = []
+        for item in items_sorted:
+            if len(kept) >= cfg['total_cap']:
+                break
+            sector = (item.get('sector_kr') or '').strip()
+            if not sector:
+                # 경제지표·FOMC 등은 섹터 상한 미적용
+                kept.append(item)
+                continue
+            count = sector_count.get(sector, 0)
+            if count < cfg['sector_cap']:
+                kept.append(item)
+                sector_count[sector] = count + 1
+
+        us[slot] = kept
+
+    logger.info(
+        "[정렬·상한] this_week=%d, this_month=%d, next_2_months=%d",
+        len(us.get('this_week', [])),
+        len(us.get('this_month', [])),
+        len(us.get('next_2_months', [])),
+    )
+    return briefing
+
+
 # ---------------------------------------------------------------------------
 # 메인 분석 함수
 # ---------------------------------------------------------------------------
@@ -280,8 +434,10 @@ def build_morning_briefing(
             disp_part = f", {disp}" if disp and disp != "-" else ""
             rev = e.get("revenue_estimate", "-")
             rev_part = f" / 매출 {rev}" if rev and rev != "-" else ""
+            # v1.5.16: D+N 명시로 AI 슬롯 배치 정확도 상승
+            days_until = e.get("days_until", "?")
             earnings_lines.append(
-                f"- {e['earnings_date']} [{e['sector_kr']}] {e['name_kr']}({e['ticker']})\n"
+                f"- {e['earnings_date']} [D+{days_until}] [{e['sector_kr']}] {e['name_kr']}({e['ticker']})\n"
                 f"    예상 EPS {e['eps_estimate']}{flag} (직전분기 실제 {e['last_quarter_eps_actual']}"
                 f", 전년동기 실제 {e['yoy_eps_actual']}{disp_part}){rev_part}"
                 f" / 컨센서스 {e['recommendation']}"
@@ -416,10 +572,14 @@ def build_morning_briefing(
     "금융", "헬스케어/제약", "산업/항공/방산", "미디어/통신", "에너지", "유틸리티/리츠"
   ★ "반도체 산업", "AI/빅테크" 같이 변형하지 말 것. Python 측 사후 필터가 정확 매칭만 함.
   ★ 위 명칭에 해당하지 않는 새 섹터를 선정할 경우, upcoming_schedule 의 해당 섹터 항목이 사후 필터로 모두 제거됨.
-- upcoming_schedule: 향후 60일 주요 일정을 다음 3개 슬롯으로 분류.
-  · this_week: 0~7일, importance=3, 최대 6개
-  · this_month: 8~30일, importance=2, 최대 5개
-  · next_2_months: 31~60일, importance=1, 최대 5개
+- upcoming_schedule: 향후 60일 주요 일정을 다음 3개 슬롯으로 분류 (v1.5.16 규칙 명확화).
+  ★ 각 실적 항목 옆에 표시된 [D+N] 값을 그대로 사용해 슬롯 배치:
+    · this_week: **D+0 ~ D+7** (오늘~7일 후), importance=3
+    · this_month: **D+8 ~ D+30** (8~30일 후), importance=2
+    · next_2_months: **D+31 ~ D+60** (31~60일 후), importance=1
+  ★ 예: [D+6] 인 실적은 this_week 슬롯에, [D+21] 인 실적은 this_month 슬롯에.
+  ★ AI 가 날짜를 자체 계산하지 말 것. 반드시 제공된 [D+N] 사용.
+  ★ 슬롯 상한은 AI 측 참고값이며 Python 사후 처리에서 재조정됨.
   ★ leading_sectors 의 sector_kr 과 일치하는 실적만 포함. 그 외 섹터 실적은 생략.
   ★ 슬롯 한도 초과 시 임박 날짜 우선.
   ★ 실적 발표 항목의 event 필드는 반드시 "<회사명> 실적 발표" 형식으로 작성 (예: "마이크론 실적 발표", "JP모건 실적 발표").
@@ -481,6 +641,13 @@ def build_morning_briefing(
             logger.info("오전 브리핑 AI 분석 완료 (%d자)", len(response.text))
             # v1.5.10: 주도섹터 사후 필터 강제
             result = _filter_upcoming_by_leading_sectors(result)
+
+            # v1.5.16: 3단계 슬롯 후처리 (필터 → 재배치 → 상한/정렬)
+            # (1) 실제 days 로 슬롯 재배치 (AI 오분류 보정)
+            result = _reassign_upcoming_slots_by_days(result, datetime.now(KST).date())
+            # (2) 섹터별 상한 + 주도섹터 우선 정렬
+            result = _cap_and_sort_by_sector_priority(result)
+
             return result
 
         except Exception as e:
@@ -564,8 +731,10 @@ def build_afternoon_briefing(
             disp_part = f", {disp}" if disp and disp != "-" else ""
             rev = e.get("revenue_estimate", "-")
             rev_part = f" / 매출 {rev}" if rev and rev != "-" else ""
+            # v1.5.16: D+N 명시로 AI 슬롯 배치 정확도 상승
+            days_until = e.get("days_until", "?")
             earnings_lines.append(
-                f"- {e['earnings_date']} [{e['sector_kr']}] {e['name_kr']}({e['ticker']})\n"
+                f"- {e['earnings_date']} [D+{days_until}] [{e['sector_kr']}] {e['name_kr']}({e['ticker']})\n"
                 f"    예상 EPS {e['eps_estimate']}{flag} (직전분기 실제 {e['last_quarter_eps_actual']}"
                 f", 전년동기 실제 {e['yoy_eps_actual']}{disp_part}){rev_part}"
                 f" / 컨센서스 {e['recommendation']}"
@@ -693,10 +862,14 @@ def build_afternoon_briefing(
     "금융", "헬스케어/제약", "산업/항공/방산", "미디어/통신", "에너지", "유틸리티/리츠"
   ★ "반도체 산업", "AI/빅테크" 같이 변형하지 말 것. Python 측 사후 필터가 정확 매칭만 함.
   ★ 위 명칭에 해당하지 않는 새 섹터를 선정할 경우, upcoming_schedule 의 해당 섹터 항목이 사후 필터로 모두 제거됨.
-- upcoming_schedule: 향후 60일 주요 일정을 다음 3개 슬롯으로 분류.
-  · this_week: 0~7일, importance=3, 최대 6개
-  · this_month: 8~30일, importance=2, 최대 5개
-  · next_2_months: 31~60일, importance=1, 최대 5개
+- upcoming_schedule: 향후 60일 주요 일정을 다음 3개 슬롯으로 분류 (v1.5.16 규칙 명확화).
+  ★ 각 실적 항목 옆에 표시된 [D+N] 값을 그대로 사용해 슬롯 배치:
+    · this_week: **D+0 ~ D+7** (오늘~7일 후), importance=3
+    · this_month: **D+8 ~ D+30** (8~30일 후), importance=2
+    · next_2_months: **D+31 ~ D+60** (31~60일 후), importance=1
+  ★ 예: [D+6] 인 실적은 this_week 슬롯에, [D+21] 인 실적은 this_month 슬롯에.
+  ★ AI 가 날짜를 자체 계산하지 말 것. 반드시 제공된 [D+N] 사용.
+  ★ 슬롯 상한은 AI 측 참고값이며 Python 사후 처리에서 재조정됨.
   ★ leading_sectors 의 sector_kr 과 일치하는 실적만 포함. 그 외 섹터 실적은 생략.
   ★ 슬롯 한도 초과 시 임박 날짜 우선.
   ★ 실적 발표 항목의 event 필드는 반드시 "<회사명> 실적 발표" 형식으로 작성 (예: "마이크론 실적 발표", "JP모건 실적 발표").
@@ -757,6 +930,13 @@ def build_afternoon_briefing(
             logger.info("오후 브리핑 AI 분석 완료 (%d자)", len(response.text))
             # v1.5.10: 주도섹터 사후 필터 강제
             result = _filter_upcoming_by_leading_sectors(result)
+
+            # v1.5.16: 3단계 슬롯 후처리 (필터 → 재배치 → 상한/정렬)
+            # (1) 실제 days 로 슬롯 재배치 (AI 오분류 보정)
+            result = _reassign_upcoming_slots_by_days(result, datetime.now(KST).date())
+            # (2) 섹터별 상한 + 주도섹터 우선 정렬
+            result = _cap_and_sort_by_sector_priority(result)
+
             return result
 
         except Exception as e:
