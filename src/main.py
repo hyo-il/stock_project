@@ -2,6 +2,7 @@
 
 import logging
 import os
+import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -63,19 +64,30 @@ def main() -> None:
     logger.info("=== 주식 정보 자동 알림 시작: %s [%s] ===", today_str, mode)
 
     if mode == "morning":
-        _run_morning(today_str)
+        ok = _run_morning(today_str)
     else:
-        _run_afternoon(today_str)
+        ok = _run_afternoon(today_str)
 
     logger.info("=== 주식 정보 자동 알림 종료 ===")
+
+    # v1.5.18: 실패를 종료 코드로 노출한다.
+    # 이전에는 AI 분석이 전량 실패해도 Actions 가 초록으로 끝나 사고를 알아챌 수 없었다
+    # (2026-08 Gemini API 키 무효화 건이 미탐지된 원인).
+    if not ok:
+        logger.error("브리핑이 정상 완료되지 않았습니다. 종료 코드 1 로 종료합니다.")
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------
 # 오전 브리핑
 # ---------------------------------------------------------------------------
 
-def _run_morning(today_str: str) -> None:
-    """오전 브리핑 실행 흐름."""
+def _run_morning(today_str: str) -> bool:
+    """오전 브리핑 실행 흐름.
+
+    Returns:
+        브리핑 생성·전송이 모두 성공했는지 여부 (v1.5.18).
+    """
 
     # 1단계: 뉴스 수집
     raw_news = {"domestic": [], "foreign": []}
@@ -132,16 +144,23 @@ def _run_morning(today_str: str) -> None:
             logger.info("텔레그램 전송 성공")
         else:
             logger.error("텔레그램 전송 실패")
+        # v1.5.18: AI 분석이 실패한 채로 나간 브리핑도 실패로 간주한다.
+        return success and briefing is not None
     except Exception as e:
         logger.error("메시지 포맷팅·전송 중 예외 발생: %s", e)
+        return False
 
 
 # ---------------------------------------------------------------------------
 # 오후 브리핑
 # ---------------------------------------------------------------------------
 
-def _run_afternoon(today_str: str) -> None:
-    """오후 브리핑 실행 흐름."""
+def _run_afternoon(today_str: str) -> bool:
+    """오후 브리핑 실행 흐름.
+
+    Returns:
+        브리핑 생성·전송이 모두 성공했는지 여부 (v1.5.18).
+    """
 
     # 1단계: 뉴스 수집 (국내 중심)
     raw_news = {"domestic": [], "foreign": []}
@@ -197,8 +216,11 @@ def _run_afternoon(today_str: str) -> None:
             logger.info("텔레그램 전송 성공")
         else:
             logger.error("텔레그램 전송 실패")
+        # v1.5.18: AI 분석이 실패한 채로 나간 브리핑도 실패로 간주한다.
+        return success and briefing is not None
     except Exception as e:
         logger.error("메시지 포맷팅·전송 중 예외 발생: %s", e)
+        return False
 
 
 # ---------------------------------------------------------------------------

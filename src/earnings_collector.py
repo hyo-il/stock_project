@@ -1,7 +1,7 @@
 """주요 기업 실적 발표 일정 + 전망치 수집 모듈 (yfinance 기반).
 
 v1.5.6:
-    - 티커 풀 18개 → 약 75개 (EXTENDED_TICKERS, 섹터 태그 포함)
+    - 티커 풀 78개 (미국 76 + 국내 2, EXTENDED_TICKERS, 섹터 태그 포함)
     - 수집 기간 7일 → 90일 (향후 3개월)
     - 전망치 4종 (EPS 추정 / 매출 추정 / 전년 동기 실제 EPS / 애널리스트 컨센서스)
     - 2-phase ThreadPoolExecutor 병렬 수집
@@ -273,6 +273,7 @@ def _yf_calendar_safe(ticker: str, per_call_timeout: float = 10.0):
 
 # 주요 미국 대형주 티커 → (한국어 기업명, 한국어 섹터명) 매핑
 # v1.5.6: 18개 → 75개로 확장. 섹터 태그 추가. AI가 주도섹터 기반 필터링 수행.
+# v1.5.14: 국내 2종목 편입하여 현재 78개 (미국 76 + 국내 2).
 EXTENDED_TICKERS = {
     # ── 빅테크 / AI ─────────────────────────────────────────
     "AAPL":  ("애플",            "빅테크/AI"),
@@ -386,7 +387,7 @@ def collect_upcoming_earnings(days_ahead: int = 60) -> list:
         - 기본 기간 90일 → 60일 (옵션 IV·컨센서스 revision 활발기 기준)
     v1.5.6~v1.5.8 변경:
         - 기본 기간 7일 → 90일 (v1.5.6)
-        - 티커 풀 18개 → 약 75개 (EXTENDED_TICKERS)
+        - 티커 풀 78개 (미국 76 + 국내 2, EXTENDED_TICKERS)
         - 섹터 태그 포함
         - 전망치 4종 (EPS, Revenue, YoY 실제, Recommendations)
         - ThreadPoolExecutor 로 병렬화

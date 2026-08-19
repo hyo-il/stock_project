@@ -218,9 +218,13 @@ def _fetch_us2y_from_fred() -> dict:
     import requests
     from datetime import date as _date
 
-    FRED_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2"
+    # v1.5.18: cosd(관측 시작일)로 최근 구간만 요청한다.
+    # 이전에는 1976년부터의 전체 시계열(약 13,000행)을 매번 내려받아 10초 타임아웃이
+    # 빈발했다. 직전 영업일 대비 등락만 필요하므로 30일치면 충분하다.
+    _start = (datetime.now(KST) - timedelta(days=30)).strftime("%Y-%m-%d")
+    FRED_URL = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS2&cosd={_start}"
     try:
-        resp = requests.get(FRED_URL, timeout=10,
+        resp = requests.get(FRED_URL, timeout=15,
                             headers={"User-Agent": "Mozilla/5.0"})
         resp.raise_for_status()
 

@@ -473,7 +473,7 @@ def build_morning_briefing(
 [매크로 자산 (전일 종가)]
 {macro_text or "  (데이터 없음)"}
 
-[향후 60일 주요 기업 실적 발표 예정 (yfinance 실제 데이터, 75개 대형주 풀에서 수집)]
+[향후 60일 주요 기업 실적 발표 예정 (yfinance 실제 데이터, 78개 대형주 풀에서 수집)]
 {earnings_text}
 
 [오늘 국내 뉴스]
@@ -765,7 +765,7 @@ def build_afternoon_briefing(
 [시장 공포 지수]
 {vix_level or "  (데이터 없음)"}
 
-[향후 60일 주요 기업 실적 발표 예정 (yfinance 실제 데이터, 75개 대형주 풀에서 수집)]
+[향후 60일 주요 기업 실적 발표 예정 (yfinance 실제 데이터, 78개 대형주 풀에서 수집)]
 {earnings_text}
 
 [오늘 국내 뉴스]
