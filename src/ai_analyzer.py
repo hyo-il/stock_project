@@ -26,7 +26,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-3.6-flash"
 MAX_AI_ATTEMPTS = 3  # v1.5.12: 2 → 3 (503 high demand spike 대응)
 
 
@@ -63,14 +63,14 @@ def _get_gemini_client():
 def _make_json_gen_config():
     """JSON 응답 강제 generation_config.
 
-    gemini-2.5-flash는 thinking 모델 → thinking_budget=0 필수.
-    미설정 시 thinking 토큰이 output 한도를 소비하여 응답이 잘림.
+    gemini-3.x 는 thinking 토큰이 max_output_tokens 를 잠식하지 않으므로
+    thinking_config 를 지정하지 않는다. (2.5 계열의 thinking_budget=0 은
+    3.x 에서 INVALID_ARGUMENT 400 을 유발하므로 절대 되살리지 말 것.)
     """
     try:
         from google.genai import types as genai_types
         return genai_types.GenerateContentConfig(
             response_mime_type="application/json",
-            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
             max_output_tokens=8192,
             temperature=0.1,
         )
