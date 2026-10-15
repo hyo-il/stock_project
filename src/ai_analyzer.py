@@ -28,21 +28,25 @@ logger = logging.getLogger(__name__)
 KST = ZoneInfo("Asia/Seoul")
 MODEL_NAME = "gemini-3.6-flash"
 
-# v1.5.19: 503 과부하 대응 강화.
-# 주 모델은 대기 간격을 늘려 4회 시도 (15s → 30s → 60s, 최대 대기 105초).
-# 그래도 실패하면 폴백 모델로 넘어가 모델당 2회 시도 (15s 간격).
-# v1.5.12 의 3회·5/10초는 503 스파이크가 풀리기 전(30초 이내)에 끝나버려 2026-10 연속 실패.
-PRIMARY_RETRY_WAITS = [15, 30, 60]   # 주 모델: 시도 사이 대기(초) → 총 4회 시도
-FALLBACK_RETRY_WAITS = [15]          # 폴백 모델: 시도 사이 대기(초) → 모델당 2회 시도
-MAX_FALLBACK_MODELS = 2
-MAX_AI_ATTEMPTS = len(PRIMARY_RETRY_WAITS) + 1  # 하위 호환용 (주 모델 시도 횟수)
+# v1.5.20: 무료 티어 기준 "모델 순환" 방식.
+# 한 모델에서 오래 기다리지 않고, 후보 모델들을 한 바퀴씩 돌며 시도한다.
+#   라운드 1: 주 모델 → (실패 시 후보 조회) → 후보 모델들을 바로 이어서 시도
+#   라운드 2·3: 각각 20초·40초 쉰 뒤 남은 모델을 다시 한 바퀴
+# 무료 한도 보호: 1회 실행당 Gemini 호출은 최대 MAX_TOTAL_CALLS 회.
+MAX_EXTRA_MODELS = 3            # 주 모델 외 후보 모델 수 (flash / flash-lite 계열)
+ROUND_WAITS = [20, 40]          # 라운드 사이 대기(초) → 최대 3라운드
+MAX_TOTAL_CALLS = 8             # 1회 실행당 generate_content 호출 상한
+REQUEST_TIMEOUT_MS = 90_000     # 호출 1건 타임아웃 (503 응답이 65초 걸린 사례 대응)
+MAX_AI_ATTEMPTS = MAX_TOTAL_CALLS  # 하위 호환용
 
-# 재시도할 가치가 있는 일시 오류 (과부하·한도·서버 오류)
-_RETRYABLE_CODES = {429, 500, 502, 503, 504}
-# 이 모델로는 더 시도할 의미가 없어 다음 모델로 넘어갈 오류
-_NEXT_MODEL_CODES = {400, 404}
-# 키·권한 문제 — 어떤 모델로 바꿔도 실패하므로 즉시 중단
-_FATAL_CODES = {401, 403}
+# 과부하·일시 서버 오류 → 이 모델은 다음 라운드에 다시 시도
+_RETRY_LATER_CODES = {500, 502, 503, 504}
+# 이 모델은 이번 실행에서 제외
+#   429 = 무료 한도 소진(분당/일일) — 같은 모델 재시도는 시간 낭비
+#   403 = 무료 티어 미제공 등 권한 없음 / 400 = 이 모델이 요청 거부 / 404 = 모델 없음
+_DROP_MODEL_CODES = {400, 403, 404, 429}
+# 키 자체 문제 → 어떤 모델로도 안 되므로 즉시 중단
+_FATAL_CODES = {401}
 
 
 # ---------------------------------------------------------------------------
@@ -50,33 +54,38 @@ _FATAL_CODES = {401, 403}
 # ---------------------------------------------------------------------------
 
 def _error_code(exc: Exception) -> Optional[int]:
-    """google-genai 예외에서 HTTP 상태 코드를 추출. 네트워크 오류 등은 None."""
+    """google-genai 예외에서 HTTP 상태 코드를 추출. 네트워크 오류·타임아웃 등은 None."""
     code = getattr(exc, "code", None)
     if isinstance(code, int):
         return code
     return None
 
 
+def _is_key_error(exc: Exception) -> bool:
+    """API 키가 잘못된 경우 (Gemini 는 400 'API key not valid' 로 응답하기도 함)."""
+    msg = str(exc).lower()
+    return "api key not valid" in msg or "api_key_invalid" in msg
+
+
 def _model_version_key(name: str):
-    """폴백 후보 정렬 키: 버전 높은 순 → lite 아닌 것 먼저."""
+    """후보 정렬 키: 버전 높은 순 → lite 아닌 것 먼저."""
     m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
     ver = float(m.group(1)) if m else 0.0
     return (-ver, "lite" in name, name)
 
 
 def _discover_fallback_models(client, exclude: set) -> list:
-    """폴백 모델 목록을 결정합니다 (v1.5.19).
+    """후보 모델 목록 (v1.5.19 도입, v1.5.20 최대 3개로 확대).
 
-    1순위: 환경변수 GEMINI_FALLBACK_MODELS (쉼표 구분) — 사용자가 명시하면 그대로 사용.
-    2순위: API 의 models.list() 로 실시간 조회 — 모델명을 코드에 하드코딩하지 않기 위함
-           (2.5 계열이 예고 없이 차단된 전례가 있어 고정 이름은 언젠가 깨진다).
-    조회 조건: generateContent 지원 · gemini flash 계열 · 텍스트용(이미지/음성/임베딩 제외)
-              · 1.x/2.x 제외(신규 키 차단) · 주 모델 제외.
+    1순위: 환경변수 GEMINI_FALLBACK_MODELS (쉼표 구분).
+    2순위: API 의 models.list() 로 실시간 조회 — 모델명 하드코딩 금지.
+    조회 조건: generateContent 지원 · gemini flash 계열(무료 한도가 넉넉한 계열, pro 제외)
+              · 텍스트용(이미지/음성/임베딩 제외) · 1.x/2.x 제외 · 주 모델 제외.
     """
     env = os.environ.get("GEMINI_FALLBACK_MODELS", "").strip()
     if env:
         names = [n.strip().replace("models/", "") for n in env.split(",") if n.strip()]
-        return [n for n in names if n not in exclude][:MAX_FALLBACK_MODELS]
+        return [n for n in names if n not in exclude][:MAX_EXTRA_MODELS]
 
     skip_words = ("image", "tts", "audio", "live", "embedding", "robotics",
                   "computer-use", "native", "exp")
@@ -98,74 +107,91 @@ def _discover_fallback_models(client, exclude: set) -> list:
                 continue
             found.append(name)
     except Exception as e:
-        logger.warning("폴백 모델 조회 실패: %s", e)
+        logger.warning("후보 모델 조회 실패: %s", e)
         return []
 
     found.sort(key=_model_version_key)
-    return found[:MAX_FALLBACK_MODELS]
+    return found[:MAX_EXTRA_MODELS]
 
 
 def _generate_briefing_json(client, prompt: str, required: list, label: str):
-    """Gemini 호출 + 재시도 + 모델 폴백 + JSON 파싱·필수키 검증 (v1.5.19 공통 헬퍼).
+    """Gemini 호출 + 모델 순환 + JSON 파싱·필수키 검증 (v1.5.20 공통 헬퍼).
 
-    오전·오후 브리핑이 같은 로직을 쓰도록 한 곳에 모았다.
     Returns:
         (result_dict, raw_text, model_name) 성공 시, 실패 시 None.
     """
     json_config = _make_json_gen_config()
 
-    def _try_model(model: str, waits: list):
-        attempts = len(waits) + 1
-        for i in range(attempts):
-            kwargs = {"model": model, "contents": prompt}
-            if json_config:
-                kwargs["config"] = json_config
-            try:
-                response = client.models.generate_content(**kwargs)
-                text = response.text or ""
-                result = _parse_json_response(text)
-                missing = [k for k in required if k not in (result or {})]
-                if not missing:
-                    return ("ok", (result, text))
-                logger.warning("[%s %d/%d] 누락된 키: %s", model, i + 1, attempts, missing)
-            except Exception as e:
-                code = _error_code(e)
-                logger.error("[%s %d/%d] %s 실패 (code=%s): %s",
-                             model, i + 1, attempts, label, code, str(e)[:300])
-                if code in _FATAL_CODES:
-                    return ("fatal", None)
-                if code in _NEXT_MODEL_CODES:
-                    return ("next", None)
-                # 그 외(503·429·500·네트워크 오류·파싱 오류)는 같은 모델로 재시도
-            if i < len(waits):
-                logger.info("Gemini 재시도 대기 %d초 (%s)", waits[i], model)
-                time.sleep(waits[i])
-        return ("next", None)
+    def _call_once(model: str):
+        """1회 호출. ('ok', (result, text)) / ('later', None) / ('drop', None) / ('fatal', None)."""
+        kwargs = {"model": model, "contents": prompt}
+        if json_config:
+            kwargs["config"] = json_config
+        try:
+            response = client.models.generate_content(**kwargs)
+            text = response.text or ""
+            result = _parse_json_response(text)
+            missing = [k for k in required if k not in (result or {})]
+            if not missing:
+                return ("ok", (result, text))
+            logger.warning("[%s] %s 응답에 누락된 키: %s", model, label, missing)
+            return ("later", None)
+        except Exception as e:
+            code = _error_code(e)
+            logger.error("[%s] %s 실패 (code=%s): %s", model, label, code, str(e)[:300])
+            if code in _FATAL_CODES or _is_key_error(e):
+                return ("fatal", None)
+            if code in _DROP_MODEL_CODES:
+                if code == 429:
+                    logger.warning("[%s] 무료 한도 소진(429) — 이번 실행에서 제외", model)
+                return ("drop", None)
+            return ("later", None)   # 503 등 과부하·타임아웃·파싱 오류
 
-    # 1) 주 모델
-    status, payload = _try_model(MODEL_NAME, PRIMARY_RETRY_WAITS)
-    if status == "ok":
-        return payload[0], payload[1], MODEL_NAME
-    if status == "fatal":
-        logger.error("Gemini 키/권한 오류로 중단합니다 (GEMINI_API_KEY 확인 필요).")
-        return None
+    active = [MODEL_NAME]
+    discovered = False
+    calls = 0
 
-    # 2) 폴백 모델
-    fallbacks = _discover_fallback_models(client, exclude={MODEL_NAME})
-    if not fallbacks:
-        logger.error("사용 가능한 폴백 모델이 없습니다.")
-    else:
-        logger.warning("주 모델 %s 실패 → 폴백 모델 시도: %s", MODEL_NAME, fallbacks)
-    for model in fallbacks:
-        status, payload = _try_model(model, FALLBACK_RETRY_WAITS)
-        if status == "ok":
-            logger.warning("폴백 모델 %s 로 %s 성공", model, label)
-            return payload[0], payload[1], model
-        if status == "fatal":
-            logger.error("Gemini 키/권한 오류로 중단합니다.")
-            return None
+    for rnd in range(len(ROUND_WAITS) + 1):
+        if rnd > 0:
+            wait = ROUND_WAITS[rnd - 1]
+            logger.info("Gemini 라운드 %d 대기 %d초 (남은 모델: %s)", rnd + 1, wait, active)
+            time.sleep(wait)
 
-    logger.error("Gemini %s: 주 모델·폴백 모델 모두 실패.", label)
+        i = 0
+        while i < len(active):
+            if calls >= MAX_TOTAL_CALLS:
+                break
+            model = active[i]
+            calls += 1
+            status, payload = _call_once(model)
+
+            if status == "ok":
+                if model != MODEL_NAME:
+                    logger.warning("후보 모델 %s 로 %s 성공", model, label)
+                return payload[0], payload[1], model
+            if status == "fatal":
+                logger.error("Gemini 키 오류로 중단합니다 (GEMINI_API_KEY 확인 필요).")
+                return None
+
+            # 첫 실패 직후 한 번만 후보 모델 조회 → 같은 라운드에서 바로 이어서 시도
+            if not discovered:
+                discovered = True
+                extra = _discover_fallback_models(client, exclude={MODEL_NAME})
+                if extra:
+                    logger.warning("주 모델 %s 실패 → 후보 모델: %s", MODEL_NAME, extra)
+                    active.extend(extra)
+                else:
+                    logger.warning("사용 가능한 후보 모델이 없습니다.")
+
+            if status == "drop":
+                active.pop(i)       # 제외 — 인덱스 유지
+            else:
+                i += 1              # 다음 라운드에 다시
+
+        if not active or calls >= MAX_TOTAL_CALLS:
+            break
+
+    logger.error("Gemini %s: 모든 후보 모델 실패 (호출 %d회).", label, calls)
     return None
 
 
@@ -177,7 +203,12 @@ def _get_gemini_client():
         return None
     try:
         from google import genai
-        return genai.Client(api_key=api_key)
+        from google.genai import types as genai_types
+        # v1.5.20: 호출 1건 타임아웃 (응답이 수십 초씩 지연되는 경우 대비)
+        return genai.Client(
+            api_key=api_key,
+            http_options=genai_types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+        )
     except ImportError:
         logger.warning("google-genai 패키지가 설치되지 않았습니다.")
         return None
