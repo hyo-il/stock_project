@@ -27,23 +27,146 @@ logger = logging.getLogger(__name__)
 
 KST = ZoneInfo("Asia/Seoul")
 MODEL_NAME = "gemini-3.6-flash"
-MAX_AI_ATTEMPTS = 3  # v1.5.12: 2 → 3 (503 high demand spike 대응)
+
+# v1.5.19: 503 과부하 대응 강화.
+# 주 모델은 대기 간격을 늘려 4회 시도 (15s → 30s → 60s, 최대 대기 105초).
+# 그래도 실패하면 폴백 모델로 넘어가 모델당 2회 시도 (15s 간격).
+# v1.5.12 의 3회·5/10초는 503 스파이크가 풀리기 전(30초 이내)에 끝나버려 2026-10 연속 실패.
+PRIMARY_RETRY_WAITS = [15, 30, 60]   # 주 모델: 시도 사이 대기(초) → 총 4회 시도
+FALLBACK_RETRY_WAITS = [15]          # 폴백 모델: 시도 사이 대기(초) → 모델당 2회 시도
+MAX_FALLBACK_MODELS = 2
+MAX_AI_ATTEMPTS = len(PRIMARY_RETRY_WAITS) + 1  # 하위 호환용 (주 모델 시도 횟수)
+
+# 재시도할 가치가 있는 일시 오류 (과부하·한도·서버 오류)
+_RETRYABLE_CODES = {429, 500, 502, 503, 504}
+# 이 모델로는 더 시도할 의미가 없어 다음 모델로 넘어갈 오류
+_NEXT_MODEL_CODES = {400, 404}
+# 키·권한 문제 — 어떤 모델로 바꿔도 실패하므로 즉시 중단
+_FATAL_CODES = {401, 403}
 
 
 # ---------------------------------------------------------------------------
 # Gemini 클라이언트 / 설정 헬퍼
 # ---------------------------------------------------------------------------
 
-def _ai_retry_backoff(attempt: int) -> None:
-    """v1.5.12: Gemini 재시도 사이 선형 백오프. 시도1 실패 후 5초, 시도2 실패 후 10초.
+def _error_code(exc: Exception) -> Optional[int]:
+    """google-genai 예외에서 HTTP 상태 코드를 추출. 네트워크 오류 등은 None."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    return None
 
-    503 (high demand spike) 등 일시 장애 흡수용. 마지막 시도 뒤에는 대기하지 않음.
-    Google 공식 권고 "Spikes in demand are usually temporary. Please try again later." 대응.
+
+def _model_version_key(name: str):
+    """폴백 후보 정렬 키: 버전 높은 순 → lite 아닌 것 먼저."""
+    m = re.search(r"gemini-(\d+(?:\.\d+)?)", name)
+    ver = float(m.group(1)) if m else 0.0
+    return (-ver, "lite" in name, name)
+
+
+def _discover_fallback_models(client, exclude: set) -> list:
+    """폴백 모델 목록을 결정합니다 (v1.5.19).
+
+    1순위: 환경변수 GEMINI_FALLBACK_MODELS (쉼표 구분) — 사용자가 명시하면 그대로 사용.
+    2순위: API 의 models.list() 로 실시간 조회 — 모델명을 코드에 하드코딩하지 않기 위함
+           (2.5 계열이 예고 없이 차단된 전례가 있어 고정 이름은 언젠가 깨진다).
+    조회 조건: generateContent 지원 · gemini flash 계열 · 텍스트용(이미지/음성/임베딩 제외)
+              · 1.x/2.x 제외(신규 키 차단) · 주 모델 제외.
     """
-    if attempt < MAX_AI_ATTEMPTS - 1:
-        wait_seconds = 5 * (attempt + 1)
-        logger.info("Gemini 재시도 대기 %d초", wait_seconds)
-        time.sleep(wait_seconds)
+    env = os.environ.get("GEMINI_FALLBACK_MODELS", "").strip()
+    if env:
+        names = [n.strip().replace("models/", "") for n in env.split(",") if n.strip()]
+        return [n for n in names if n not in exclude][:MAX_FALLBACK_MODELS]
+
+    skip_words = ("image", "tts", "audio", "live", "embedding", "robotics",
+                  "computer-use", "native", "exp")
+    found = []
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            low = name.lower()
+            actions = getattr(m, "supported_actions", None) or []
+            if "generateContent" not in actions:
+                continue
+            if not low.startswith("gemini-") or "flash" not in low:
+                continue
+            if low.startswith(("gemini-1", "gemini-2")):
+                continue
+            if any(w in low for w in skip_words):
+                continue
+            if name in exclude:
+                continue
+            found.append(name)
+    except Exception as e:
+        logger.warning("폴백 모델 조회 실패: %s", e)
+        return []
+
+    found.sort(key=_model_version_key)
+    return found[:MAX_FALLBACK_MODELS]
+
+
+def _generate_briefing_json(client, prompt: str, required: list, label: str):
+    """Gemini 호출 + 재시도 + 모델 폴백 + JSON 파싱·필수키 검증 (v1.5.19 공통 헬퍼).
+
+    오전·오후 브리핑이 같은 로직을 쓰도록 한 곳에 모았다.
+    Returns:
+        (result_dict, raw_text, model_name) 성공 시, 실패 시 None.
+    """
+    json_config = _make_json_gen_config()
+
+    def _try_model(model: str, waits: list):
+        attempts = len(waits) + 1
+        for i in range(attempts):
+            kwargs = {"model": model, "contents": prompt}
+            if json_config:
+                kwargs["config"] = json_config
+            try:
+                response = client.models.generate_content(**kwargs)
+                text = response.text or ""
+                result = _parse_json_response(text)
+                missing = [k for k in required if k not in (result or {})]
+                if not missing:
+                    return ("ok", (result, text))
+                logger.warning("[%s %d/%d] 누락된 키: %s", model, i + 1, attempts, missing)
+            except Exception as e:
+                code = _error_code(e)
+                logger.error("[%s %d/%d] %s 실패 (code=%s): %s",
+                             model, i + 1, attempts, label, code, str(e)[:300])
+                if code in _FATAL_CODES:
+                    return ("fatal", None)
+                if code in _NEXT_MODEL_CODES:
+                    return ("next", None)
+                # 그 외(503·429·500·네트워크 오류·파싱 오류)는 같은 모델로 재시도
+            if i < len(waits):
+                logger.info("Gemini 재시도 대기 %d초 (%s)", waits[i], model)
+                time.sleep(waits[i])
+        return ("next", None)
+
+    # 1) 주 모델
+    status, payload = _try_model(MODEL_NAME, PRIMARY_RETRY_WAITS)
+    if status == "ok":
+        return payload[0], payload[1], MODEL_NAME
+    if status == "fatal":
+        logger.error("Gemini 키/권한 오류로 중단합니다 (GEMINI_API_KEY 확인 필요).")
+        return None
+
+    # 2) 폴백 모델
+    fallbacks = _discover_fallback_models(client, exclude={MODEL_NAME})
+    if not fallbacks:
+        logger.error("사용 가능한 폴백 모델이 없습니다.")
+    else:
+        logger.warning("주 모델 %s 실패 → 폴백 모델 시도: %s", MODEL_NAME, fallbacks)
+    for model in fallbacks:
+        status, payload = _try_model(model, FALLBACK_RETRY_WAITS)
+        if status == "ok":
+            logger.warning("폴백 모델 %s 로 %s 성공", model, label)
+            return payload[0], payload[1], model
+        if status == "fatal":
+            logger.error("Gemini 키/권한 오류로 중단합니다.")
+            return None
+
+    logger.error("Gemini %s: 주 모델·폴백 모델 모두 실패.", label)
+    return None
 
 
 def _get_gemini_client():
@@ -617,47 +740,20 @@ def build_morning_briefing(
   ★ 투자 권유 표현 금지 ("매수하세요" 등). 권유성은 "진입 후보로 검토 가능" 형태로.
 - 인사말·서문·결론 문구 금지."""
 
-    # ── Gemini 호출 (최대 3회 시도 + 선형 백오프, v1.5.12) ───────────────
-    json_config = _make_json_gen_config()
-    kwargs = {"model": MODEL_NAME, "contents": prompt}
-    if json_config:
-        kwargs["config"] = json_config
+    # ── Gemini 호출 (v1.5.19: 긴 백오프 + 모델 폴백, 공통 헬퍼) ─────────
+    required = ["market_regime", "key_themes", "leading_sectors", "swing_check", "upcoming_schedule", "portfolio_adjustment"]
+    out = _generate_briefing_json(client, prompt, required, "오전 브리핑")
+    if out is None:
+        return None
+    result, raw_text, used_model = out
+    logger.info("오전 브리핑 AI 분석 완료 (%d자, model=%s)", len(raw_text), used_model)
 
-    last_response_text = None
-    for attempt in range(MAX_AI_ATTEMPTS):
-        try:
-            response = client.models.generate_content(**kwargs)
-            last_response_text = response.text
-            result = _parse_json_response(response.text)
-
-            # 필수 키 검증
-            required = ["market_regime", "key_themes", "leading_sectors", "swing_check", "upcoming_schedule", "portfolio_adjustment"]
-            missing = [k for k in required if k not in result]
-            if missing:
-                logger.warning("[시도 %d/%d] 누락된 키: %s. 재시도합니다.", attempt + 1, MAX_AI_ATTEMPTS, missing)
-                _ai_retry_backoff(attempt)
-                continue
-
-            logger.info("오전 브리핑 AI 분석 완료 (%d자)", len(response.text))
-            # v1.5.10: 주도섹터 사후 필터 강제
-            result = _filter_upcoming_by_leading_sectors(result)
-
-            # v1.5.16: 3단계 슬롯 후처리 (필터 → 재배치 → 상한/정렬)
-            # (1) 실제 days 로 슬롯 재배치 (AI 오분류 보정)
-            result = _reassign_upcoming_slots_by_days(result, datetime.now(KST).date())
-            # (2) 섹터별 상한 + 주도섹터 우선 정렬
-            result = _cap_and_sort_by_sector_priority(result)
-
-            return result
-
-        except Exception as e:
-            logger.error("[시도 %d/%d] Gemini 오전 브리핑 분석 실패: %s", attempt + 1, MAX_AI_ATTEMPTS, e)
-            if last_response_text:
-                logger.debug("응답 원시 텍스트 (첫 500자): %s", last_response_text[:500])
-            _ai_retry_backoff(attempt)
-
-    logger.error("Gemini 분석 %d회 모두 실패.", MAX_AI_ATTEMPTS)
-    return None
+    # v1.5.10: 주도섹터 사후 필터 강제
+    result = _filter_upcoming_by_leading_sectors(result)
+    # v1.5.16: 3단계 슬롯 후처리 (필터 → 재배치 → 상한/정렬)
+    result = _reassign_upcoming_slots_by_days(result, datetime.now(KST).date())
+    result = _cap_and_sort_by_sector_priority(result)
+    return result
 
 
 def build_afternoon_briefing(
@@ -907,43 +1003,17 @@ def build_afternoon_briefing(
   ★ 투자 권유 표현 금지 ("매수하세요" 등). 권유성은 "진입 후보로 검토 가능" 형태로.
 - 인사말·서문·결론 문구 금지."""
 
-    # ── Gemini 호출 (최대 3회 시도 + 선형 백오프, v1.5.12) ───────────────
-    json_config = _make_json_gen_config()
-    kwargs = {"model": MODEL_NAME, "contents": prompt}
-    if json_config:
-        kwargs["config"] = json_config
+    # ── Gemini 호출 (v1.5.19: 긴 백오프 + 모델 폴백, 공통 헬퍼) ─────────
+    required = ["market_summary", "key_themes", "leading_sectors", "swing_check", "upcoming_schedule", "portfolio_adjustment"]
+    out = _generate_briefing_json(client, prompt, required, "오후 브리핑")
+    if out is None:
+        return None
+    result, raw_text, used_model = out
+    logger.info("오후 브리핑 AI 분석 완료 (%d자, model=%s)", len(raw_text), used_model)
 
-    last_response_text = None
-    for attempt in range(MAX_AI_ATTEMPTS):
-        try:
-            response = client.models.generate_content(**kwargs)
-            last_response_text = response.text
-            result = _parse_json_response(response.text)
-
-            required = ["market_summary", "key_themes", "leading_sectors", "swing_check", "upcoming_schedule", "portfolio_adjustment"]
-            missing = [k for k in required if k not in result]
-            if missing:
-                logger.warning("[시도 %d/%d] 누락된 키: %s. 재시도합니다.", attempt + 1, MAX_AI_ATTEMPTS, missing)
-                _ai_retry_backoff(attempt)
-                continue
-
-            logger.info("오후 브리핑 AI 분석 완료 (%d자)", len(response.text))
-            # v1.5.10: 주도섹터 사후 필터 강제
-            result = _filter_upcoming_by_leading_sectors(result)
-
-            # v1.5.16: 3단계 슬롯 후처리 (필터 → 재배치 → 상한/정렬)
-            # (1) 실제 days 로 슬롯 재배치 (AI 오분류 보정)
-            result = _reassign_upcoming_slots_by_days(result, datetime.now(KST).date())
-            # (2) 섹터별 상한 + 주도섹터 우선 정렬
-            result = _cap_and_sort_by_sector_priority(result)
-
-            return result
-
-        except Exception as e:
-            logger.error("[시도 %d/%d] Gemini 오후 브리핑 분석 실패: %s", attempt + 1, MAX_AI_ATTEMPTS, e)
-            if last_response_text:
-                logger.debug("응답 원시 텍스트 (첫 500자): %s", last_response_text[:500])
-            _ai_retry_backoff(attempt)
-
-    logger.error("Gemini 오후 브리핑 분석 %d회 모두 실패.", MAX_AI_ATTEMPTS)
-    return None
+    # v1.5.10: 주도섹터 사후 필터 강제
+    result = _filter_upcoming_by_leading_sectors(result)
+    # v1.5.16: 3단계 슬롯 후처리 (필터 → 재배치 → 상한/정렬)
+    result = _reassign_upcoming_slots_by_days(result, datetime.now(KST).date())
+    result = _cap_and_sort_by_sector_priority(result)
+    return result
